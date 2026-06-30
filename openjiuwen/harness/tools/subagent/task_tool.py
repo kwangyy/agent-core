@@ -182,16 +182,25 @@ class TaskTool(Tool):
                     sub_session_id=sub_session_id,
                     parent_session_id=parent_session_id,
                 )
-            # Invoke subagent with isolated session_id
-            subagent_inputs = {
-                "query": task_description,
-                "conversation_id": sub_session_id,
-            }
-            if affinity_enabled:
-                subagent_inputs["parent_session_id"] = parent_session_id
-            result = await subagent.invoke(subagent_inputs)
+            # Browser-style subagents expose run_isolated_tasks: a plan/execute
+            # split that decomposes the task and runs each subtask in its own
+            # isolated session (bounded per-subtask context). Drive that surface
+            # when present; fall back to a single plain invoke otherwise, or when
+            # the planner produced no tasks.
+            output: Optional[str] = None
+            if hasattr(subagent, "run_isolated_tasks"):
+                output = await self._run_isolated_tasks(subagent, str(task_description))
+            if output is None:
+                # Invoke subagent with isolated session_id
+                subagent_inputs = {
+                    "query": task_description,
+                    "conversation_id": sub_session_id,
+                }
+                if affinity_enabled:
+                    subagent_inputs["parent_session_id"] = parent_session_id
+                result = await subagent.invoke(subagent_inputs)
+                output = result.get("output", "")
             succeeded = True
-            output = result.get("output", "")
             return ToolOutput(success=True, data={"output": output, "agent_id": subagent.card.id}, error=None)
         except Exception as e:
             logger.error(f"[TaskTool] Subagent: {subagent_type} execution failed, error={e}")
@@ -209,6 +218,37 @@ class TaskTool(Tool):
                     parent_session_id=parent_session_id,
                     succeeded=succeeded,
                 )
+
+    @staticmethod
+    async def _run_isolated_tasks(subagent, task_description: str) -> Optional[str]:
+        """Drive a browser-style subagent through its plan/execute split.
+
+        Consumes the orchestration event stream (``plan_created`` →
+        ``task_started`` → ``task_complete`` → ``assistant_final``) and returns
+        the consolidated reply. Returns ``None`` when the planner produced no
+        tasks, so the caller falls back to a plain single invoke.
+        """
+        final_reply = ""
+        task_replies: List[str] = []
+        saw_plan_tasks = False
+        async for event in subagent.run_isolated_tasks(task_description):
+            etype = event.get("type")
+            data = event.get("data") or {}
+            if etype == "plan_created":
+                plan = data.get("plan") or {}
+                saw_plan_tasks = bool(plan.get("tasks"))
+            elif etype == "task_complete":
+                reply = str(data.get("reply", ""))
+                if reply:
+                    task_replies.append(reply)
+            elif etype == "assistant_final":
+                final_reply = str(data.get("reply", ""))
+            elif etype == "interrupt":
+                result = data.get("result") or {}
+                return str(result.get("output", "")) or "\n".join(task_replies)
+        if not saw_plan_tasks:
+            return None
+        return final_reply or "\n".join(task_replies)
 
     async def stream(self, inputs: Input, **kwargs) -> AsyncIterator[Output]:
         pass

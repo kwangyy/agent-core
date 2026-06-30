@@ -371,6 +371,14 @@ class TaskPlanningRail(DeepAgentRail):
             len(todos),
         )
 
+    def find_todo_tool(self) -> Optional[TodoTool]:
+        """Public accessor for the registered TodoTool.
+
+        Used by isolated browser orchestration to read back the plan; internal
+        callers use the same lookup via :meth:`_find_todo_tool`.
+        """
+        return self._find_todo_tool()
+
     def _find_todo_tool(self) -> Optional[TodoTool]:
         """Return the first TodoTool in self.tools."""
         if not self.tools:

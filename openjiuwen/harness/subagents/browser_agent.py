@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import uuid
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
 
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.context_engine import ToolResultWindowProcessorConfig
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig
 from openjiuwen.core.foundation.tool import McpServerConfig, Tool, ToolCard
+from openjiuwen.core.session.agent import Session
 from openjiuwen.core.single_agent.rail.base import AgentRail
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.core.sys_operation import SysOperation
@@ -20,6 +22,7 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.tools.browser_move.browser_orchestration import run_browser_isolated_tasks
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
@@ -290,8 +293,14 @@ def build_browser_agent_config(
     settings: Optional[RuntimeSettings] = None,
     browser_key: Optional[str] = None,
     browser_instance: Optional[BrowserInstanceConfig | Dict[str, Any]] = None,
+    enable_isolated_orchestration: bool = False,
 ) -> SubAgentConfig:
-    """Build a SubAgentConfig that materializes as create_browser_agent()."""
+    """Build a SubAgentConfig that materializes as create_browser_agent().
+
+    When ``enable_isolated_orchestration`` is True the materialized agent is a
+    :class:`BrowserAgent` exposing ``run_isolated_tasks`` (plan/execute split);
+    the delegating ``TaskTool`` drives that surface instead of a plain invoke.
+    """
     resolved_language = resolve_language(language)
     instance = _coerce_browser_instance(browser_instance, browser_key)
     browser_model = _browser_model_with_temperature(model, temperature)
@@ -323,8 +332,96 @@ def build_browser_agent_config(
         enable_task_loop=enable_task_loop,
         max_iterations=max_iterations,
         factory_name=BROWSER_AGENT_FACTORY_NAME,
-        factory_kwargs={"settings": resolved_settings},
+        factory_kwargs={
+            "settings": resolved_settings,
+            "enable_isolated_orchestration": enable_isolated_orchestration,
+        },
     )
+
+
+class BrowserAgent(DeepAgent):
+    """Browser subagent plus isolated-subtask orchestration.
+
+    Identical to the agent returned by :func:`create_browser_agent` —
+    ``invoke``/``stream`` keep their original single-round/task-loop behavior —
+    with one added capability: :meth:`run_isolated_tasks` plans a query into
+    discrete tasks and runs each in its own session, so per-task context stays
+    bounded instead of accumulating across the whole job.
+
+    The two-agent split is preserved: this browser agent carries NO task
+    planning (no todo tools, no planning prompt), so its execution subtasks
+    stay lean. Planning is delegated to a separate lightweight planner built
+    on demand (:meth:`_orchestration_planner`). The orchestration drives both
+    agents through their normal ``invoke``; it does not replace it.
+    """
+
+    # Set on the instance by create_browser_agent so the planner can be built.
+    _orch_model: Optional[Model] = None
+    _orch_language: Optional[str] = None
+    _orch_planner: Optional[DeepAgent] = None
+
+    def attach_orchestration(self, *, model: Optional[Model], language: Optional[str]) -> None:
+        """Stash what the on-demand planner needs.
+
+        Called once by :func:`create_browser_agent` right after the agent's
+        class is retagged to ``BrowserAgent``. Keeping the writes here (rather
+        than reaching into the instance from the factory) lets the planner
+        state stay owned by the class.
+        """
+        self._orch_model = model
+        self._orch_language = language
+        self._orch_planner = None
+
+    def _orchestration_planner(self) -> DeepAgent:
+        """Lazily build the lightweight planner (task planning, no browser tools).
+
+        Keeping planning on a separate agent is what preserves the bounded
+        execution context: the browser agent itself has no todo tools or
+        planning prompt, so each isolated subtask opens small.
+        """
+        if self._orch_planner is None:
+            self._orch_planner = create_deep_agent(
+                model=self._orch_model,
+                enable_task_planning=True,
+                language=self._orch_language,
+            )
+        return self._orch_planner
+
+    def run_isolated_tasks(
+        self,
+        user_query: str,
+        *,
+        session: Optional[Session] = None,
+        executor: Optional[DeepAgent] = None,
+        session_factory: Optional[Any] = None,
+        tab_preamble: str = "",
+        reuse_browser_tab: bool = False,
+        inject_tool_trace: bool = False,
+        system_prompt: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Plan ``user_query`` then execute its tasks in isolated sessions.
+
+        Yields the orchestration events (``plan_created``, ``task_started``,
+        ``task_complete``, ``assistant_final``, ``plan_update``, ``interrupt``).
+        Planning runs on the lightweight planner; execution defaults to this
+        (lean) browser agent. Pass ``executor`` to run subtasks elsewhere.
+        """
+        planner = self._orchestration_planner()
+        if session is None:
+            session = Session(session_id=f"browser_orch_{uuid.uuid4().hex[:8]}", card=planner.card)
+        return run_browser_isolated_tasks(
+            planner,
+            user_query,
+            session=session,
+            executor=executor or self,
+            session_factory=session_factory,
+            tab_preamble=tab_preamble,
+            reuse_browser_tab=reuse_browser_tab,
+            inject_tool_trace=inject_tool_trace,
+            system_prompt=system_prompt,
+            language=language,
+        )
 
 
 def create_browser_agent(
@@ -337,6 +434,7 @@ def create_browser_agent(
     subagents: Optional[List[SubAgentConfig | DeepAgent]] = None,
     rails: Optional[List[AgentRail]] = None,
     enable_task_loop: bool = False,
+    enable_isolated_orchestration: bool = False,
     max_iterations: int = DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
     temperature: float = DEFAULT_BROWSER_AGENT_TEMPERATURE,
     workspace: Optional[str | "Workspace"] = None,
@@ -356,6 +454,12 @@ def create_browser_agent(
     ``browser_capabilities`` is resolved against the trusted capability
     catalog here. Core is always applied, including when the caller omits the
     optional capability list.
+
+    When ``enable_isolated_orchestration`` is True the returned agent is a
+    :class:`BrowserAgent` (original behavior + ``run_isolated_tasks``). The
+    browser agent stays lean — planning is delegated to a separate lightweight
+    planner — so execution context is not enlarged. Otherwise behavior is
+    unchanged.
     """
     if browser_capabilities is not None and (
         not isinstance(browser_capabilities, list)
@@ -375,7 +479,6 @@ def create_browser_agent(
         resolved_capabilities.selected_names,
         resolved_capabilities.allowed_tool_names,
     )
-
     resolved_language = resolve_language(language)
     instance = _coerce_browser_instance(browser_instance, browser_key)
     browser_model = _browser_model_with_temperature(model, temperature)
@@ -458,11 +561,19 @@ def create_browser_agent(
         browser_backend.release_task_resources,
         prepare=browser_backend.acquire_task_resources,
     )
+    if enable_isolated_orchestration:
+        # DeepAgent uses __dict__ (no __slots__), so retagging the class to a
+        # method-only subclass is layout-safe and adds run_isolated_tasks
+        # without disturbing any configured state. Stash what the on-demand
+        # planner needs (the browser agent itself stays planning-free).
+        agent.__class__ = BrowserAgent
+        agent.attach_orchestration(model=model, language=resolved_language)
     return agent
 
 
 __all__ = [
     "BROWSER_AGENT_FACTORY_NAME",
+    "BrowserAgent",
     "DEFAULT_BROWSER_AGENT_MAX_ITERATIONS",
     "DEFAULT_BROWSER_AGENT_TEMPERATURE",
     "build_browser_agent_config",
