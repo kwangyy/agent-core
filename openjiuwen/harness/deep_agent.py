@@ -1615,6 +1615,17 @@ class DeepAgent(BaseAgent):
                         **dict(spec.factory_kwargs or {}),
                     )
                 )
+            if normalized_factory in {"cua_agent", "desktop_agent"}:
+                from openjiuwen.harness.subagents.cua_agent import (
+                    create_cua_agent,
+                )
+
+                return self._bind_inherited_artifact_root(
+                    create_cua_agent(
+                        **create_kwargs,
+                        **dict(spec.factory_kwargs or {}),
+                    )
+                )
 
             raise build_error(
                 StatusCode.DEEPAGENT_CREATE_SUBAGENT_NOT_FOUND,

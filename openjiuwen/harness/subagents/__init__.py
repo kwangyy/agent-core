@@ -20,6 +20,10 @@ from openjiuwen.harness.subagents.mobile_gui_agent import (
     build_mobile_gui_agent_config,
     create_mobile_gui_agent,
 )
+from openjiuwen.harness.subagents.cua_agent import (
+    build_cua_agent_config,
+    create_cua_agent,
+)
 
 __all__ = [
     "build_browser_agent_config",
@@ -32,4 +36,6 @@ __all__ = [
     "create_verification_agent",
     "build_mobile_gui_agent_config",
     "create_mobile_gui_agent",
+    "build_cua_agent_config",
+    "create_cua_agent",
 ]
