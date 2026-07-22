@@ -1101,6 +1101,18 @@ wheels = [
 ]
 
 [[package]]
+name = "cua-driver"
+version = "0.28.1"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/8b/23/8f455932fe7ddcde7e40d2fc886f74eaa47c7bcb3b7151691e3c623f571b/cua_driver-0.28.1-py3-none-macosx_13_0_universal2.whl", hash = "sha256:6578fd45fb710394751736c7231f69ee428aa5d23b41b72090e97a0c9291dd2d" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/5a/e6/dd225c83c5cc773570d6003919a3c459222b1d95b9ba126092590f5f0178/cua_driver-0.28.1-py3-none-manylinux_2_31_aarch64.whl", hash = "sha256:5881a85d7a1cbb13c60a8e2de09184ed0353ff44bdc5ce1e81528157be8137fd" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/9d/b9/dd936a64fa9b0d27ba930b356ab5a824306d58fbfb5ea73ce3182db51777/cua_driver-0.28.1-py3-none-manylinux_2_31_x86_64.whl", hash = "sha256:1f516ea8f289695f48c7d569d46666ee8191c6e51816a621f104cbf30138a4c2" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/bb/87/4ad5c4732a68a92ef028978abec5d085183ebdd4f999381cf263d4e748d7/cua_driver-0.28.1-py3-none-win_amd64.whl", hash = "sha256:c61aaa28592df04308ed41c52318da825c739ba47128c64e9018dd118200ab43" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/77/24/d1babac689b5f10349ab48ee3e22d8901a184cb38ee2cfbd9d3be68ffa1b/cua_driver-0.28.1-py3-none-win_arm64.whl", hash = "sha256:452ce1bac95d3dcb86505dd952c001c55d2858f8f8f5b8999b221d05296fa6aa" },
+]
+
+[[package]]
 name = "culsans"
 version = "0.11.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
@@ -3121,6 +3133,7 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "cacheout" },
     { name = "charset-normalizer" },
+    { name = "cua-driver" },
     { name = "dashscope" },
     { name = "docx2txt" },
     { name = "fastmcp" },
@@ -3135,6 +3148,7 @@ dependencies = [
     { name = "oauthlib" },
     { name = "openai" },
     { name = "openpyxl" },
+    { name = "opentelemetry-sdk" },
     { name = "pdfplumber" },
     { name = "portalocker" },
     { name = "pycryptodome" },
@@ -3360,12 +3374,13 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'chromadb'", specifier = ">=1.5.4" },
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.115" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.0" },
+    { name = "cua-driver", specifier = ">=0.10.0" },
     { name = "dashscope", specifier = ">=1.25.6" },
     { name = "deepseek-harness-sdk", marker = "extra == 'dsh'", specifier = ">=0.1.1rc1" },
     { name = "docx2txt", specifier = ">=0.8" },
     { name = "elasticsearch", extras = ["async"], marker = "extra == 'elasticsearch'", specifier = ">=8.0.0" },
     { name = "fastapi", marker = "extra == 'online-rl'", specifier = ">=0.100" },
-    { name = "fastmcp", specifier = ">=2.14.2,<3.0" },
+    { name = "fastmcp", specifier = ">=2.14.2,<4.0" },
     { name = "filelock", specifier = ">=3.25.0" },
     { name = "gitcode-api", specifier = ">=1.2.20" },
     { name = "httpx", marker = "extra == 'jiuwen-memory'", specifier = ">=0.24" },
@@ -3392,6 +3407,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'observability'", specifier = ">=1.25.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'observability'", specifier = ">=1.25.0" },
     { name = "opentelemetry-proto", marker = "extra == 'chromadb'", specifier = ">=1.33.0" },
+    { name = "opentelemetry-sdk", specifier = ">=1.25.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'observability'", specifier = ">=1.25.0" },
     { name = "pandas", marker = "extra == 'online-rl'" },
     { name = "pdfplumber", specifier = ">=0.11.8" },

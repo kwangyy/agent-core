@@ -79,6 +79,8 @@ dependencies = [
     # under fastmcp 2.x it was provided transitively, but fastmcp 3.x (fastmcp-slim)
     # no longer pulls it, so declare it explicitly to keep imports working.
     "opentelemetry-sdk>=1.25.0",
+    # Computer-use desktop driver (bundles the cua-driver binary + console script)
+    "cua-driver>=0.10.0",
 ]
 
 # A2A: required for `openjiuwen.remote_clients` / `openjiuwen.server_adapters` A2A entry
