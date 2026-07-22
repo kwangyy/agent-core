@@ -57,6 +57,29 @@ _PATH_TOOLS = frozenset({
 })
 _NETWORK_TOOLS = frozenset({"mcp_fetch_webpage", "mcp_free_search", "mcp_paid_search"})
 
+# cua-driver desktop-control tools (mouse/keyboard/app lifecycle). Names are the
+# model-facing MCP names (``mcp_{server_name}_{tool}``); the cua agent's default
+# server_name is ``cua-driver``. NOTE: instance-isolated servers (created with a
+# non-empty ``cua_instance_key`` -> ``cua-driver-<key>``) produce different tool
+# names and are NOT covered by these built-in rules yet.
+_OS_CONTROL_TOOLS = frozenset({
+    "mcp_cua-driver_click",
+    "mcp_cua-driver_double_click",
+    "mcp_cua-driver_right_click",
+    "mcp_cua-driver_drag",
+    "mcp_cua-driver_type_text",
+    "mcp_cua-driver_press_key",
+    "mcp_cua-driver_hotkey",
+    "mcp_cua-driver_set_value",
+    "mcp_cua-driver_scroll",
+    "mcp_cua-driver_launch_app",
+    "mcp_cua-driver_kill_app",
+    "mcp_cua-driver_bring_to_front",
+})
+
+# Structured argument values an os_control rule pattern may match against.
+_OS_CONTROL_ARG_KEYS = frozenset({"text", "name", "bundle_id", "value", "key", "keys"})
+
 _PATH_ARG_KEYS = frozenset({
     "path", "file_path", "target_file", "file", "old_path", "new_path",
     "source_path", "dest_path", "directory", "dir",
@@ -100,6 +123,8 @@ def _tool_category(
         return "path"
     if tool_name in _NETWORK_TOOLS:
         return "network"
+    if tool_name in _OS_CONTROL_TOOLS:
+        return "os_control"
     return None
 
 
@@ -189,6 +214,30 @@ def _path_pattern_matches(pattern: str, value: str) -> bool:
             logger.warning("[PermissionEngine] permission.tiered_policy.invalid_path_regex expr=%r", expr)
             return False
     return _TIERED_PATH_MATCHER.match_path(p, value)
+
+
+def _os_control_pattern_matches(pattern: str, tool_args: dict[str, Any]) -> bool:
+    """os_control rule matching.
+
+    ``*`` matches any invocation of the tool (whole-tool guardrail). Any other
+    pattern is matched (exact / glob / ``re:``) against the tool's relevant
+    string arguments (text, app name/bundle, key names).
+    """
+    p = (pattern or "").strip()
+    if not p:
+        return False
+    if p == "*":
+        return True
+    for key in _OS_CONTROL_ARG_KEYS:
+        val = tool_args.get(key)
+        if isinstance(val, str):
+            if val.strip() and _shell_pattern_matches(p, val.strip()):
+                return True
+        elif isinstance(val, list):
+            joined = " ".join(str(x) for x in val if x is not None).strip()
+            if joined and _shell_pattern_matches(p, joined):
+                return True
+    return False
 
 
 def _tool_arg_value_looks_like_path(arg_key: str, value: str) -> bool:
@@ -349,6 +398,8 @@ def tiered_policy_rule_matches(
     if cat == "network":
         # 产品设计：网络类暂仅整工具；参数规则不匹配
         return False
+    if cat == "os_control":
+        return _os_control_pattern_matches(pattern, tool_args)
     return False
 
 

@@ -1032,6 +1032,18 @@ wheels = [
 ]
 
 [[package]]
+name = "cua-driver"
+version = "0.10.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/fa/8e/3d27a2ca154c87bd094208e3c5d4728a301771debab8a25fbf11596fc978/cua_driver-0.10.0-py3-none-macosx_11_0_universal2.whl", hash = "sha256:fff2a558d3da2c514ceb9aa3a01e799a02246a8055e3c67ded0dd6974d0fa40b" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/ba/25/35b6ef26a836c8373ecd9fef17d526b4088a285c62391a983acd1c6792cb/cua_driver-0.10.0-py3-none-manylinux_2_31_aarch64.whl", hash = "sha256:041c31ab1c64e6e995147bced8437f83f89d547493ea5cc3ca68da3780ac003b" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/4e/50/d60bb9a634d6e34920eea992c12638822ac67920bbb1da711fecc5cf6c51/cua_driver-0.10.0-py3-none-manylinux_2_31_x86_64.whl", hash = "sha256:2c7ef282c4b9afd863c0e918c1de7508e2bdbfb84098f3958f928a3e76507db5" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/41/c2/33e5414b5ae35cf17874af24825f4ebbfbcaa94ac0c956de5272dc39c21a/cua_driver-0.10.0-py3-none-win_amd64.whl", hash = "sha256:0068e2fea6c5ad493d7d7f7687294c2cdd89164525dfd5cbfc8033f556ae28b7" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/b8/a4/b6e1d7abcff3babdeff73de1c4aea150c726ef9022e0754699a6e4fa1666/cua_driver-0.10.0-py3-none-win_arm64.whl", hash = "sha256:c408bd90f78e336ea287f08edccee09420ef2d97d213f5f4a42a3bde6df4deb3" },
+]
+
+[[package]]
 name = "culsans"
 version = "0.11.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
@@ -1096,6 +1108,29 @@ source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/60/8b/32f9823da46cde7df2087faa08cd98d01b908f8dcab982cdba9c84e85355/decorator-5.3.1.tar.gz", hash = "sha256:4cbcdd55a6efadb9dbea26b858f4fb3264567b52d69ca0d25b721b553f60ea82" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/05/7f/798705f5296a58ca505d600456748d1be48078eac8a7050d8a98bc9edb89/decorator-5.3.1-py3-none-any.whl", hash = "sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c" },
+]
+
+[[package]]
+name = "deepseek-harness-runtime-bin"
+version = "0.1.2a3"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/b6/34/75ffd1a299973efce14cbc4b887436f634276ad04230462cbd51972c87c9/deepseek_harness_runtime_bin-0.1.2a3-py3-none-macosx_14_0_arm64.whl", hash = "sha256:fb82bf60c4cd5e793bed6caa5060589a31f349342bd9f4bb70826a854419c32d" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/ec/0a/ad19adb1e6278ac66952a9901ad1df76e7d99875eb37998a7178c88d39eb/deepseek_harness_runtime_bin-0.1.2a3-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:42f073f30c1ccbd46edcef7410c4e550a65d35efdf9a16da190223412a64cd02" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/9f/f0/ab1d5969e7963a609e531c705e85eb0672faa481e772452e3f22793aea1c/deepseek_harness_runtime_bin-0.1.2a3-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:857968930814517baa8299f80c915beb253ce14b981a17e02916030ce30d17e8" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/96/5a/d10ecc84b20666698c1b5397ccd21e825c04d40614653dbd6dfb8590b365/deepseek_harness_runtime_bin-0.1.2a3-py3-none-win_amd64.whl", hash = "sha256:76af793a5202ea878eee2d6153ccb140a6787f846e33b03f0340366f7274568d" },
+]
+
+[[package]]
+name = "deepseek-harness-sdk"
+version = "0.1.2a3"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+dependencies = [
+    { name = "deepseek-harness-runtime-bin" },
+    { name = "pydantic" },
+]
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/cd/54/c37b73a5a06a1ac9fd797b19d304dcc79b753dd2345838909e370e03d1cc/deepseek_harness_sdk-0.1.2a3-py3-none-any.whl", hash = "sha256:3c8b09f5b3ffd7322afb05bc30b365b86479ac1cd2017884d2c583900eca73ec" },
 ]
 
 [[package]]
@@ -2872,6 +2907,7 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "cacheout" },
     { name = "charset-normalizer" },
+    { name = "cua-driver" },
     { name = "dashscope" },
     { name = "docx2txt" },
     { name = "fastmcp" },
@@ -2961,6 +2997,9 @@ cli = [
 ]
 codex = [
     { name = "openai-codex" },
+]
+dsh = [
+    { name = "deepseek-harness-sdk" },
 ]
 elasticsearch = [
     { name = "elasticsearch", extra = ["async"] },
@@ -3106,7 +3145,9 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'chromadb'", specifier = ">=1.5.4" },
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.115" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.0" },
+    { name = "cua-driver", specifier = ">=0.10.0" },
     { name = "dashscope", specifier = ">=1.25.6" },
+    { name = "deepseek-harness-sdk", marker = "extra == 'dsh'", specifier = ">=0.1.1rc1" },
     { name = "docx2txt", specifier = ">=0.8" },
     { name = "elasticsearch", extras = ["async"], marker = "extra == 'elasticsearch'", specifier = ">=8.0.0" },
     { name = "fastapi", marker = "extra == 'online-rl'", specifier = ">=0.100" },
@@ -3169,7 +3210,7 @@ requires-dist = [
     { name = "uiautomator2", marker = "extra == 'mobile-gui'", specifier = ">=3.2.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'online-rl'" },
 ]
-provides-extras = ["all-a2a", "pulsar", "elasticsearch", "redis", "sqlite", "postgres", "mysql", "gaussdb", "pgvector", "gaussvector", "chromadb", "obs", "zmq", "sandbox", "mem0", "jiuwen-memory", "agentarts", "claude", "codex", "ssh", "observability", "mobile-gui", "online-rl", "all-mq", "all-storage", "all-vector", "cli", "default", "all"]
+provides-extras = ["all-a2a", "pulsar", "elasticsearch", "redis", "sqlite", "postgres", "mysql", "gaussdb", "pgvector", "gaussvector", "chromadb", "obs", "zmq", "sandbox", "mem0", "jiuwen-memory", "agentarts", "claude", "codex", "dsh", "ssh", "observability", "mobile-gui", "online-rl", "all-mq", "all-storage", "all-vector", "cli", "default", "all"]
 
 [package.metadata.requires-dev]
 dev = [

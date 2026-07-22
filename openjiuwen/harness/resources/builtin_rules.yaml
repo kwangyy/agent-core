@@ -144,6 +144,34 @@ rules:
     severity: HIGH
     action: ask
 
+  # --- cua-driver desktop control (os_control) ---
+  # Model-facing MCP names for the default cua agent server_name "cua-driver".
+  # These fire only when the permission engine is enabled; pattern "*" means the
+  # rule guards any invocation of the tool regardless of arguments.
+  - id: cua_desktop_force_terminate_app
+    description: "强制终止桌面进程（kill_app），未保存的数据会丢失"
+    tools: [mcp_cua-driver_kill_app]
+    match_type: os_control
+    pattern: "*"
+    severity: CRITICAL
+    action: deny
+
+  - id: cua_desktop_launch_app
+    description: "启动桌面应用程序（launch_app），可能运行任意本机程序"
+    tools: [mcp_cua-driver_launch_app]
+    match_type: os_control
+    pattern: "*"
+    severity: HIGH
+    action: ask
+
+  - id: cua_desktop_type_text
+    description: "向桌面窗口注入文本输入（type_text），可能写入密码或其他敏感字段"
+    tools: [mcp_cua-driver_type_text]
+    match_type: os_control
+    pattern: "*"
+    severity: HIGH
+    action: ask
+
 # 路径内置底线（file_guard）：默认 action 写入三轴；compose 在 file_guard.enabled 时注入。
 sensitive_paths:
   - id: home_ssh

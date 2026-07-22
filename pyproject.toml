@@ -66,6 +66,8 @@ dependencies = [
     "loguru>=0.7.3",
     "gitcode-api>=1.2.20",
     "pyoxigraph>=0.5.8",
+    # Computer-use desktop driver (bundles the cua-driver binary + console script)
+    "cua-driver>=0.10.0",
 ]
 
 # A2A: required for `openjiuwen.remote_clients` / `openjiuwen.server_adapters` A2A entry
