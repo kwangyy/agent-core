@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from openjiuwen.core.context_engine import ToolResultWindowProcessorConfig
 from openjiuwen.core.foundation.llm import (
     Model,
     ModelClientConfig,
@@ -14,6 +15,7 @@ from openjiuwen.core.foundation.llm import (
 )
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.factory import create_deep_agent
+from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.subagents.cua_agent import (
     CUA_AGENT_FACTORY_NAME,
@@ -94,6 +96,38 @@ def test_create_cua_agent_registers_mcp_and_allowlist_rail() -> None:
     assert "click" in allowed
     assert "launch_app" in allowed
     assert not set(BROWSER_CUA_TOOL_NAMES).intersection(allowed)
+
+
+def test_default_wiring_windows_cua_snapshot_results() -> None:
+    """Snapshot results carry stale element_index handles and huge payloads,
+    so the sliding window must be on by default or the agent burns its
+    context window on unusable history."""
+    agent = create_cua_agent(_create_dummy_model(), language="en")
+
+    context_rails = [rail for rail in agent._pending_rails if isinstance(rail, ContextProcessorRail)]
+    assert len(context_rails) == 1
+    assert context_rails[0]._preset is False
+    processors = context_rails[0]._user_processors
+    assert len(processors) == 1
+    key, cfg = processors[0]
+    assert key == "ToolResultWindowProcessor"
+    assert isinstance(cfg, ToolResultWindowProcessorConfig)
+    # Pin the intended contract literally (not against a source constant) so a
+    # regression like a renamed tool silently dropping out is actually caught.
+    assert cfg.tool_names == [
+        "get_window_state",
+        "get_desktop_state",
+        "get_accessibility_tree",
+    ]
+    assert cfg.keep_last_k == 1
+
+
+def test_caller_context_processor_rail_suppresses_cua_injection() -> None:
+    caller_rail = ContextProcessorRail(preset=False)
+    agent = create_cua_agent(_create_dummy_model(), language="en", rails=[caller_rail])
+
+    context_rails = [rail for rail in agent._pending_rails if isinstance(rail, ContextProcessorRail)]
+    assert context_rails == [caller_rail]
 
 
 def test_create_cua_agent_rejects_unknown_capabilities() -> None:

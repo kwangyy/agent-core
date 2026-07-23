@@ -600,6 +600,26 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTaskToolSync(unittest.TestCase):
+    def test_sub_session_id_deterministic_for_resumable_subagents(self) -> None:
+        """Resumable specialists must get the same sub-session on every delegation.
+
+        verification relies on this for FAIL -> fix -> re-verify loops. browser_agent
+        and cua_agent are intentionally excluded: their session/driver state is owned
+        by a service registry outside the model session, and a sticky model session
+        here would leak an earlier, unrelated delegation's context into a fresh
+        TaskTool call.
+        """
+        for resumable in ("verification_agent",):
+            self.assertEqual(
+                TaskTool._build_sub_session_id("parent", resumable),
+                f"parent_sub_{resumable}",
+            )
+        for non_sticky in ("browser_agent", "cua_agent", "code_agent"):
+            first = TaskTool._build_sub_session_id("parent", non_sticky)
+            second = TaskTool._build_sub_session_id("parent", non_sticky)
+            self.assertIsNotNone(re.fullmatch(rf"parent_sub_{non_sticky}_[0-9a-f]{{8}}", first))
+            self.assertNotEqual(first, second)
+
     def test_create_task_tool(self) -> None:
         parent_agent = SimpleNamespace(deep_config=None)
         tools = create_task_tool(

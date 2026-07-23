@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openjiuwen.core.common.logging import logger
+from openjiuwen.core.context_engine import ToolResultWindowProcessorConfig
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.tool import McpServerConfig, Tool, ToolCard
 from openjiuwen.core.single_agent.rail.base import AgentRail
@@ -14,6 +15,7 @@ from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.core.sys_operation import SysOperation
 from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
+from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.tools.cua.config import build_cua_driver_mcp_config
 from openjiuwen.harness.tools.cua.cua_capabilities import (
@@ -222,6 +224,33 @@ def create_cua_agent(
     )
 
     injected_rails: List[AgentRail] = [CuaRuntimeRail(mcp_cfg, resolved_capabilities.allowed_tool_names)]
+
+    # Window the large desktop perception results unless the caller already
+    # manages context processors via their own ContextProcessorRail. Snapshot
+    # tools emit huge payloads (element tree + base64 screenshot), and their
+    # element_index handles go stale after every action, so only the newest
+    # result is actionable; older ones are persisted to the workspace offload
+    # directory and replaced in context by a preview placeholder.
+    cua_windowed_tool_names = [
+        "get_window_state",
+        "get_desktop_state",
+        "get_accessibility_tree",
+    ]
+    if not any(isinstance(rail, ContextProcessorRail) for rail in (rails or [])):
+        injected_rails.append(
+            ContextProcessorRail(
+                processors=[
+                    (
+                        "ToolResultWindowProcessor",
+                        ToolResultWindowProcessorConfig(
+                            tool_names=cua_windowed_tool_names,
+                            keep_last_k=1,
+                        ),
+                    )
+                ],
+                preset=False,
+            )
+        )
     final_mcps = list(mcps or []) + [mcp_cfg]
     final_rails = list(rails or []) + injected_rails
 
