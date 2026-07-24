@@ -360,6 +360,7 @@ class SseClient(McpClient):
             )
             result_content = extract_mcp_tool_result_content(
                 tool_result,
+                include_structured_content=self._include_structured_content,
                 include_image_content=self._include_image_content,
                 tool_name=tool_name,
             )

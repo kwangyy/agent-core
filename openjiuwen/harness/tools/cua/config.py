@@ -104,6 +104,9 @@ def build_cua_driver_mcp_config(instance_key: str = "") -> McpServerConfig:
         server_path="stdio://cua-driver",
         client_type="stdio",
         params=params,
+        # cua-driver puts window bounds / screen size only in structuredContent;
+        # without this the model never sees any coordinates.
+        include_structured_content=True,
     )
 
 
