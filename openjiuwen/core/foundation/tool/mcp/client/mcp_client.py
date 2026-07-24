@@ -13,6 +13,7 @@ class McpClient(BaseClient):
     def __init__(self, config: McpServerConfig):
         super().__init__()
         self._server_path = config.server_path
+        self._include_structured_content = bool(getattr(config, "include_structured_content", False))
         self._include_image_content = bool(getattr(config, "include_image_content", False))
         self._last_connect_error: Optional[BaseException] = None
 

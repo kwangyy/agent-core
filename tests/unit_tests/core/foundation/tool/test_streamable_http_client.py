@@ -321,16 +321,90 @@ class TestMcpToolResultExtraction(unittest.TestCase):
 
         self.assertEqual(result, "[image content: image/png, 6 base64 chars]")
 
-    def test_no_content_returns_none(self):
+    def test_structured_content_dropped_by_default(self):
+        # Opt-in only: without include_structured_content the extraction is
+        # byte-identical to the historical behavior, whatever the server sends.
+        tool_result = SimpleNamespace(
+            content=[SimpleNamespace(text="1 window: Untitled - Paint")],
+            structuredContent={"windows": [{"x": 10, "y": 20}]},
+        )
+
+        result = extract_mcp_tool_result_content(tool_result)
+
+        self.assertEqual(result, "1 window: Untitled - Paint")
+
+    def test_structured_content_appended_when_opted_in(self):
+        # The text summary omits window bounds; structuredContent carries them
+        # (the cua-driver list_windows shape). Dropping it makes coordinate
+        # tasks unwinnable, so opted-in servers get the JSON appended.
+        structured = {"windows": [{"window_id": 42, "x": 10, "y": 20, "width": 800, "height": 600}]}
+        tool_result = SimpleNamespace(
+            content=[SimpleNamespace(text="1 window: Untitled - Paint")],
+            structuredContent=structured,
+        )
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertIn("1 window: Untitled - Paint", result)
+        self.assertIn("[structured_content]", result)
+        self.assertIn('"width": 800', result)
+
+    def test_duplicate_structured_content_is_not_appended(self):
+        # FastMCP-style servers mirror the text into structuredContent as
+        # {"result": <text>}; appending it would double every tool result.
+        tool_result = SimpleNamespace(
+            content=[SimpleNamespace(text="plain answer")],
+            structuredContent={"result": "plain answer"},
+        )
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertEqual(result, "plain answer")
+
+    def test_oversized_structured_content_is_truncated(self):
+        from openjiuwen.core.foundation.tool.mcp.base import STRUCTURED_CONTENT_MAX_CHARS
+
+        structured = {"elements": ["x" * 100 for _ in range(200)]}
+        tool_result = SimpleNamespace(
+            content=[SimpleNamespace(text="element tree summary")],
+            structuredContent=structured,
+        )
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertIn("...(structured content truncated)", result)
+        # Bounded: text + tag + capped payload + marker, nowhere near the raw size.
+        self.assertLess(len(result), STRUCTURED_CONTENT_MAX_CHARS + 200)
+
+    def test_structured_content_only_result_is_returned(self):
+        tool_result = SimpleNamespace(content=[], structuredContent={"width": 2560, "height": 1440})
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertIn("[structured_content]", result)
+        self.assertIn('"width": 2560', result)
+
+    def test_no_content_and_no_structured_returns_none(self):
         tool_result = SimpleNamespace(content=[])
 
-        self.assertIsNone(extract_mcp_tool_result_content(tool_result))
+        self.assertIsNone(extract_mcp_tool_result_content(tool_result, include_structured_content=True))
+
+    def test_image_content_with_structured_appends_it(self):
+        tool_result = SimpleNamespace(
+            content=[SimpleNamespace(mimeType="image/png", data="abc123")],
+            structuredContent={"width": 1920, "height": 1080},
+        )
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertIn("[image content: image/png, 6 base64 chars]", result)
+        self.assertIn('"height": 1080', result)
 
 
 class TestMcpModelToolNameHelpers(unittest.TestCase):
     def test_helpers_pin_the_ability_manager_naming_convention(self):
         # Rails match tools by these names; a silent convention change in
-        # AbilityManager must fail here, not in a live run.
+        # AbilityManager must fail here, not in a live desktop run.
         from openjiuwen.core.foundation.tool.mcp.base import mcp_model_tool_name, mcp_model_tool_prefix
 
         self.assertEqual(mcp_model_tool_prefix("cua-driver"), "mcp_cua-driver_")
@@ -339,8 +413,9 @@ class TestMcpModelToolNameHelpers(unittest.TestCase):
 
 class TestMcpToolResultMultiBlockExtraction(unittest.TestCase):
     def test_text_and_image_blocks_are_both_preserved(self):
-        # Perception tools return action/state text plus a screenshot; block
-        # order must not decide which half of the result survives.
+        # cua-driver's get_window_state returns element-tree text plus a
+        # screenshot; block order must not decide which half of the
+        # perception survives.
         tool_result = SimpleNamespace(
             content=[
                 SimpleNamespace(text="window_id=1 pid=7 elements=42"),
@@ -374,6 +449,21 @@ class TestMcpToolResultMultiBlockExtraction(unittest.TestCase):
         result = extract_mcp_tool_result_content(tool_result)
 
         self.assertEqual(result, "first\n\nsecond")
+
+    def test_multi_block_with_structured_content_appended_once(self):
+        tool_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(text="element tree summary"),
+                SimpleNamespace(mimeType="image/png", data="abc123"),
+            ],
+            structuredContent={"width": 1920},
+        )
+
+        result = extract_mcp_tool_result_content(tool_result, include_structured_content=True)
+
+        self.assertIn("element tree summary", result)
+        self.assertIn("[image content: image/png, 6 base64 chars]", result)
+        self.assertEqual(result.count("[structured_content]"), 1)
 
 
 class TestMcpToolResultImageBridge(unittest.TestCase):
@@ -409,6 +499,26 @@ class TestMcpToolResultImageBridge(unittest.TestCase):
         result = extract_mcp_tool_result_content(tool_result, include_image_content=True)
 
         self.assertEqual(result, "no screenshot here")
+
+    def test_bridge_carries_structured_content_in_text_half(self):
+        tool_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(text="tree summary"),
+                SimpleNamespace(mimeType="image/png", data="abc123"),
+            ],
+            structuredContent={"width": 1920},
+        )
+
+        result = extract_mcp_tool_result_content(
+            tool_result,
+            include_structured_content=True,
+            include_image_content=True,
+            tool_name="get_window_state",
+        )
+
+        self.assertIn("[structured_content]", result.data["content"])
+        self.assertIn('"width": 1920', result.data["content"])
+        self.assertEqual(len(result.data["multimodal"]), 1)
 
 
 class TestMcpToolInvokeMultimodalWrapping(unittest.IsolatedAsyncioTestCase):
