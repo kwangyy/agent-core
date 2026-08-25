@@ -13,7 +13,6 @@ from typing import Any, Dict
 
 from openjiuwen.core.foundation.tool import McpServerConfig
 
-
 DEFAULT_CUA_DRIVER_MCP_COMMAND = "cua-driver"
 DEFAULT_CUA_DRIVER_MCP_ARGS = "mcp"
 DEFAULT_CUA_DRIVER_MCP_TIMEOUT_S = 120
@@ -64,7 +63,7 @@ def _resolve_timeout_s() -> int:
     return value if value >= 1 else DEFAULT_CUA_DRIVER_MCP_TIMEOUT_S
 
 
-def build_cua_driver_mcp_config(instance_key: str = "") -> McpServerConfig:
+def build_cua_driver_mcp_config(instance_key: str = "", *, include_image_content: bool = False) -> McpServerConfig:
     """Build the stdio MCP config that spawns ``cua-driver mcp``.
 
     The spawned process is a thin proxy: all tool execution happens in the
@@ -107,6 +106,9 @@ def build_cua_driver_mcp_config(instance_key: str = "") -> McpServerConfig:
         # cua-driver puts window bounds / screen size only in structuredContent;
         # without this the model never sees any coordinates.
         include_structured_content=True,
+        # Screenshots ride as multimodal data only when the agent opted in
+        # (vision-capable model); otherwise they stay a text placeholder.
+        include_image_content=include_image_content,
     )
 
 
