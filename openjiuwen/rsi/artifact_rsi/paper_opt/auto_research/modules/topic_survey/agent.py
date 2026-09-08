@@ -39,6 +39,12 @@ AGENT_CARD_ID = "topic-survey-agent"
 _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system.md"
 _FINALIZER_TIMEOUT_SECONDS = 180.0
 _SOURCE_EXCERPT_CHARS = 6000
+_NO_PROXY_SOURCE_HINT = (
+    " No task proxy is configured. Use the same global search, fetch, and download "
+    "workflow. If access or download fails, assume the user has not configured a "
+    "proxy. Look for another accessible source, and do not repeatedly retry the "
+    "same source."
+)
 _DOMESTIC_PORTAL_ROOT_PATHS = {
     "",
     "/",
@@ -107,11 +113,12 @@ class TopicSurveyAgent:
 
     def _search_scope(self) -> str:
         """Resolve the task's domestic/global search policy once."""
-        proxy_url = str(self._survey_config.get("web_proxy") or "").strip()
         configured_scope = str(self._survey_config.get("search_scope") or "").strip().lower()
         if configured_scope in {"domestic", "global"}:
             return configured_scope
-        return "global" if proxy_url else "domestic"
+        # A proxy is a transport option only. Keep the same global workflow
+        # when no explicit scope is configured.
+        return "global"
 
     def _create_agent(
         self,
@@ -366,12 +373,7 @@ class TopicSurveyAgent:
             "to save its raw PDF or HTML under DOWNLOAD_DIRECTORY. "
             "Then call submit_topic_survey exactly once."
         )
-        if self._search_scope() == "domestic":
-            query += (
-                " No task proxy is configured: use only the domestic academic sources "
-                "allowed by the registered tools (Baidu Scholar, CNKI, Wanfang and their "
-                "subdomains); do not retry global search engines or unrelated domains."
-            )
+        query = self._apply_source_policy(query)
         run_error: Exception | None = None
         try:
             await session.pre_run(inputs={"query": query, "conversation_id": request_id})
@@ -421,6 +423,17 @@ class TopicSurveyAgent:
                 )
             )
         )
+
+    def _apply_source_policy(self, query: str) -> str:
+        if self._search_scope() == "domestic":
+            query += (
+                " Use only the explicitly configured domestic academic sources "
+                "allowed by the registered tools (Baidu Scholar, CNKI, Wanfang and their "
+                "subdomains); do not retry global search engines or unrelated domains."
+            )
+        elif not str(self._survey_config.get("web_proxy") or "").strip():
+            query += _NO_PROXY_SOURCE_HINT
+        return query
 
     def survey(self, inputs: TopicSurveyInput) -> ResearchBrief:
         return asyncio.run(self.asurvey(inputs))
