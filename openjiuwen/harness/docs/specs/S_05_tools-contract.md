@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/tools/`（130 文件）、`openjiuwen/harness/schema/task.py` |
-| 最近一次修订日期 | 2026-09-07 |
+| 最近一次修订日期 | 2026-09-09 |
 | 关联 feature | N/A |
 
 ## 范围 / 边界
@@ -48,6 +48,10 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
 4. **工具分组簇**：
    - web：`create_web_tools()`（fetch / free_search / paid_search）+ `WebFreeSearchTool` /
      `WebFetchWebpageTool`；`is_free_search_enabled()` / `is_paid_search_enabled()` 门控。
+     付费搜索卡片的描述和 `provider` 枚举仅包含 `auto` 与当前配置了非空 Key 的供应商。
+     调用时重新读取配置：已移除的供应商和失效的环境变量覆盖回退到当前可用供应商，
+     不进入未配置供应商的 runner；全部 Key 移除时不注册工具，也不发出付费请求。
+     热重载不能因卡片 ID 相同而保留旧的付费搜索描述或参数枚举。
    - vision/audio：`create_vision_tools()` / `create_audio_tools()`；由 `VisionModelConfig`
      / `AudioModelConfig` 门控（`S_01` 不变量 8）。
    - todo：`create_todos_tool()`（`TodoCreateTool` / `TodoListTool` / `TodoGetTool` /
@@ -78,6 +82,12 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
 8. **工具装载顺序**：`create_deep_agent` / `DeepAgentConfig.tools` 进 `ability_manager`；
    rail init 再动态加工具（`SysOperationRail` 100 先铺文件系统/shell 工具，见 `S_04`
    梯队 100）。工具分批装载的时序语义由 rail priority 保证。
+9. **Browser 默认工具面保持紧凑**：默认只暴露常用 Playwright primitive、两类 Probe、
+   Batch 和受限 offload recall。诊断、取消、custom-action discovery、拖放及其他低频能力
+   通过显式 capability 启用；runtime 内部 transport 工具不进入模型工具面。
+10. **Browser 可恢复错误不消耗模型回合**：generation 刷新、单步骤 Batch primitive 改写、
+    primary link 导航、Probe JSON 一次重试和新标签页 URL 等待由 runtime 确定性处理；只有
+    无法唯一解析目标或页面语义确实不充分时才把紧凑错误返回模型。
 
 ## 接口契约
 
