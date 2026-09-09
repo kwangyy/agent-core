@@ -593,15 +593,40 @@ async def test_codex_auth_failure_retries_once_on_promoted_fallback():
 
 
 @pytest.mark.asyncio
-async def test_codex_auth_will_retry_switches_to_fallback_immediately():
-    """A structured retryable authentication failure bypasses the native retry budget."""
-    native_notifications = [
-        _notification(
-            "error",
-            error=SimpleNamespace(message="unauthorized", codex_error_info="unauthorized"),
-            will_retry=True,
+async def test_codex_auth_will_retry_notifies_until_terminal_failure_then_switches_to_fallback() -> None:
+    """Structured authentication retries are surfaced before the fallback runs."""
+    from openai_codex.generated.v2_all import (
+        CodexErrorInfo,
+        ResponseStreamDisconnected,
+        ResponseStreamDisconnectedCodexErrorInfo,
+    )
+
+    retry_error_info = CodexErrorInfo(
+        root=ResponseStreamDisconnectedCodexErrorInfo(
+            response_stream_disconnected=ResponseStreamDisconnected(http_status_code=401),
         ),
-    ]
+    )
+    native_notifications = []
+    for attempt in range(1, 6):
+        native_notifications.append(
+            _notification(
+                "error",
+                error=SimpleNamespace(
+                    message=f"Reconnecting... {attempt}/5",
+                    codex_error_info=retry_error_info,
+                ),
+                will_retry=True,
+            ),
+        )
+    native_notifications.append(
+        _notification(
+            "turn/completed",
+            turn=SimpleNamespace(
+                status="failed",
+                error=SimpleNamespace(message="request failed", codex_error_info="other"),
+            ),
+        ),
+    )
     fallback_notifications = [
         _notification("turn/completed", turn=SimpleNamespace(status="completed")),
     ]
@@ -656,8 +681,91 @@ async def test_codex_auth_will_retry_switches_to_fallback_immediately():
     assert runtime._fallback_activated is True
     assert runtime._will_retry_count == 0
     assert promotions == 1
-    assert messager.published == []
+    assert len(messager.published) == 5
+    retrying_events = [message.get_payload() for _topic_id, message in messager.published]
+    assert [event.category for event in retrying_events] == ["auth_required"] * 5
+    assert [event.attempt for event in retrying_events] == list(range(1, 6))
+    assert all(event.max_attempts == 5 for event in retrying_events)
+    assert all(event.model == "gpt-thread-effective" for event in retrying_events)
+    assert mm.sent == []
     assert fallback_client.resume_calls == [
         ("thread-1", {"model": "fallback"}),
     ]
     assert runtime._thread_id == "thread-1"
+
+
+@pytest.mark.asyncio
+async def test_codex_auth_retry_budget_exhaustion_switches_to_fallback() -> None:
+    """Authentication retry budget exhaustion activates the configured fallback."""
+    native_notifications = [
+        _notification(
+            "error",
+            error=SimpleNamespace(message="retry 1", codex_error_info="unauthorized"),
+            will_retry=True,
+        ),
+        _notification(
+            "error",
+            error=SimpleNamespace(message="retry 2", codex_error_info="unauthorized"),
+            will_retry=True,
+        ),
+    ]
+    fallback_notifications = [
+        _notification("turn/completed", turn=SimpleNamespace(status="completed")),
+    ]
+    native_config = SimpleNamespace(name="native", env={}, cwd=None, codex_bin=None)
+    fallback_config = SimpleNamespace(name="fallback", env={}, cwd=None, codex_bin=None)
+    native_client = _FakeAsyncCodex(config=native_config, thread=_FakeThread([native_notifications]))
+    fallback_client = _FakeAsyncCodex(config=fallback_config, thread=_FakeThread([fallback_notifications]))
+    clients = {"native": native_client, "fallback": fallback_client}
+    sdk = SimpleNamespace(AsyncCodex=lambda *, config: clients[config.name])
+
+    async def promote() -> bool:
+        return True
+
+    runtime = CodexSdkRuntime(
+        member_name="developer",
+        member_agent_id="team_developer",
+        team_name="team",
+        team_session_id="session",
+        sdk=sdk,
+        config=native_config,
+        thread_options={"ephemeral": False},
+        fallback_config=fallback_config,
+        fallback_thread_options={"ephemeral": False, "model": "fallback"},
+        promote_fallback_model=promote,
+        turn_idle_timeout_s=30.0,
+        turn_idle_retries=0,
+        max_will_retry_count=1,
+    )
+    runtime._test_team_session = _FakeTeamSession(_FakeMemberSession())
+    mm = _FakeMessageManager()
+    messager = _FakeMessager()
+    sink = _StatusSink()
+    from openjiuwen.agent_teams.external.reliability import RuntimeReliabilityContext
+
+    runtime._reliability_ctx = RuntimeReliabilityContext(
+        member_name="developer",
+        team_name="team",
+        session_id="session",
+        agent_kind="codex",
+        message_manager=mm,
+        messager=messager,
+        leader_name="leader",
+        update_status_cb=sink,
+    )
+    await _start(runtime)
+
+    async for _chunk in runtime._drive({"query": "hi"}):
+        pass
+
+    assert native_client.closed is True
+    assert runtime._fallback_activated is True
+    assert len(messager.published) == 1
+    retrying = messager.published[0][1].get_payload()
+    assert retrying.category == "auth_required"
+    assert retrying.attempt == 1
+    assert retrying.max_attempts == 1
+    assert mm.sent == []
+    assert fallback_client.resume_calls == [
+        ("thread-1", {"model": "fallback"}),
+    ]

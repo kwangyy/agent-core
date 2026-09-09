@@ -203,6 +203,31 @@ def test_merge_codex_failure_diagnostics_preserves_structured_cause_and_details(
     assert merged.http_status == 429
 
 
+def test_merge_codex_failure_diagnostics_prefers_prior_http_status_over_terminal_other() -> None:
+    category, merged = merge_codex_failure_diagnostics(
+        [
+            (
+                "auth_required",
+                ExternalRuntimeFailureReason(
+                    message="Reconnecting... 5/5",
+                    sdk_error_code="responseStreamDisconnected",
+                    http_status=401,
+                ),
+            ),
+        ],
+        "sdk_error",
+        ExternalRuntimeFailureReason(
+            message="request failed",
+            sdk_error_code="other",
+        ),
+    )
+
+    assert category == "auth_required"
+    assert merged.message == "Reconnecting... 5/5\nrequest failed"
+    assert merged.sdk_error_code == "responseStreamDisconnected"
+    assert merged.http_status == 401
+
+
 def test_retry_exhaustion_is_derived_from_codex_structured_variant():
     reason = _retry_exhausted_reason("retry exhausted")
 

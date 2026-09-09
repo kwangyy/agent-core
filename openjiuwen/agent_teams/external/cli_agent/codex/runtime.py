@@ -703,7 +703,10 @@ class CodexSdkRuntime(CliRuntimeBase):
                         classify_codex_exception,
                     )
 
-                    category, _ = classify_codex_exception(exc)
+                    if isinstance(exc, _CodexRetryBudgetExceeded):
+                        category = exc.category
+                    else:
+                        category, _ = classify_codex_exception(exc)
                     if category == "auth_required" and index == start_index and await self._activate_auth_fallback():
                         raise _CodexAuthFallbackRequested() from exc
                 await self._finalize_turn_failure(exc)
@@ -851,8 +854,6 @@ class CodexSdkRuntime(CliRuntimeBase):
                     if handle is not None:
                         await self._interrupt_handle(handle)
                     return False
-                if category == "auth_required" and safe_to_retry and await self._activate_auth_fallback():
-                    return True
                 self._failure_diagnostics.append((category, reason))
                 ctx.record_pending(category=category, reason=reason)
                 self._will_retry_count += 1

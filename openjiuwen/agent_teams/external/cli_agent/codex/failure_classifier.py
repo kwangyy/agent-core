@@ -61,6 +61,7 @@ _SEMANTIC_ERROR_CODES = {
     for value in CodexErrorInfoValue
     if value is not CodexErrorInfoValue.other
 }
+_OTHER_ERROR_CODE = CodexErrorInfoValue.other.value
 _RETRY_EXHAUSTED_ERROR_CODE = (
     next(iter(_v2.ResponseTooManyFailedAttemptsCodexErrorInfo.model_fields.values())).alias or ""
 )
@@ -212,10 +213,15 @@ def merge_codex_failure_diagnostics(
         return terminal_category, terminal_reason
     selected_category = terminal_category
     selected_reason = terminal_reason
-    can_use_prior_cause = is_codex_retry_exhaustion(terminal_reason) or not terminal_reason.sdk_error_code
+    can_use_prior_cause = (
+        is_codex_retry_exhaustion(terminal_reason)
+        or not terminal_reason.sdk_error_code
+        or terminal_reason.sdk_error_code == _OTHER_ERROR_CODE
+    )
     if can_use_prior_cause:
         for candidate_category, candidate_reason in reversed(diagnostics):
-            if candidate_reason.sdk_error_code in _SEMANTIC_ERROR_CODES:
+            has_known_http_status = _http_status_category(candidate_reason.http_status) is not None
+            if candidate_reason.sdk_error_code in _SEMANTIC_ERROR_CODES or has_known_http_status:
                 selected_category = candidate_category
                 selected_reason = candidate_reason
                 break
