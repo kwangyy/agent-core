@@ -16,6 +16,7 @@ from openjiuwen.core.single_agent.rail.base import ToolCallInputs
 from openjiuwen.harness.tools.cua.rails import (
     CuaDeliveryModeRail,
     CuaElementAddressingRail,
+    CuaProgressRail,
     CuaRepeatFailureRail,
     CuaRuntimeRail,
     CuaScreenshotDownscaleRail,
@@ -1177,3 +1178,205 @@ async def test_real_snapshot_payloads_carry_no_success_marker_and_still_collapse
     second = await _snap(rail, "get_window_state", win, body.format(n=51163))
 
     assert "Unchanged" in second.inputs.tool_msg.content
+
+
+# --- CuaProgressRail ---------------------------------------------------
+
+_WIN_A = "\u2705 Window state\n[element_index 1] Button 'A'\n[element_index 2] Button 'B'"
+_WIN_B = "\u2705 Window state\n[element_index 1] Button 'C'\n[element_index 2] Button 'D'"
+
+
+class _FakeSession:
+    """Minimal dict-backed session double: enough for get_state/update_state."""
+
+    def __init__(self) -> None:
+        self._state: dict = {}
+
+    def get_state(self, key):
+        return self._state.get(key)
+
+    def update_state(self, patch: dict) -> None:
+        self._state.update(patch)
+
+
+def _invoke_ctx(session=None) -> SimpleNamespace:
+    return SimpleNamespace(agent=MagicMock(), session=session or _FakeSession())
+
+
+def _after_invoke_ctx(result: dict, session=None) -> SimpleNamespace:
+    inputs = SimpleNamespace(result=result)
+    return SimpleNamespace(inputs=inputs, session=session or _FakeSession())
+
+
+@pytest.mark.asyncio
+async def test_revisit_advisory_fires_after_the_configured_threshold() -> None:
+    # Three occurrences of the same content (the digest itself, not
+    # necessarily consecutive turns) is the current, provisional threshold.
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    ctxs = [await _snap(rail, "get_window_state", win, _WIN_A) for _ in range(3)]
+
+    assert "cycling" not in ctxs[0].inputs.tool_msg.content
+    assert "cycling" not in ctxs[1].inputs.tool_msg.content
+    assert "cycling" in ctxs[2].inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_revisit_detection_survives_a_different_intervening_state() -> None:
+    # The gap this rail closes: CuaSnapshotDedupRail only ever compares a
+    # snapshot to the one immediately before it, so A -> B -> A never
+    # collapses (A != B each time). This rail keeps a short history per
+    # window, so the THIRD visit to A is still caught even with B in between.
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    ctxs = []
+    for content in (_WIN_A, _WIN_B, _WIN_A, _WIN_B, _WIN_A):
+        ctxs.append(await _snap(rail, "get_window_state", win, content))
+
+    assert all("cycling" not in c.inputs.tool_msg.content for c in ctxs[:4])
+    assert "cycling" in ctxs[4].inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_windows_are_tracked_independently_for_revisits() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+
+    ctxs_a = [await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A) for _ in range(3)]
+    ctxs_b = [await _snap(rail, "get_window_state", {"pid": 3, "window_id": 4}, _WIN_A) for _ in range(2)]
+
+    assert "cycling" in ctxs_a[2].inputs.tool_msg.content
+    assert all("cycling" not in c.inputs.tool_msg.content for c in ctxs_b)
+
+
+@pytest.mark.asyncio
+async def test_current_window_tracks_the_latest_snapshot() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await _snap(rail, "get_window_state", {"pid": 9, "window_id": 10}, _WIN_B)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["current_window"] == {"pid": 9, "window_id": 10}
+
+
+@pytest.mark.asyncio
+async def test_blockers_accumulate_for_non_success_action_responses() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    ctx = _result_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"}, _FAILURE)
+    await rail.after_tool_call(ctx)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == [f"type_text: {_FAILURE}"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_freshness_neutral_responses_are_never_blockers() -> None:
+    # get_window_state and read-only observers never carry the driver's
+    # success marker even when they succeed, so they must be excluded from
+    # blocker detection or every successful snapshot would look "blocked".
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await rail.after_tool_call(
+        _result_ctx("mcp_cua-driver_list_windows", {}, "pid=1 title=Notepad")
+    )
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == []
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_writes_cua_result_onto_the_answer_payload() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_type_text", {"pid": 1}, _FAILURE))
+
+    result: dict = {"output": "partial progress"}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    cua_result = result["cua_result"]
+    assert cua_result["status"] == "partial"
+    assert cua_result["current_window"] == {"pid": 1, "window_id": 2}
+    assert cua_result["blockers"] == [f"type_text: {_FAILURE}"]
+    assert cua_result["recommended_recovery"]
+    assert cua_result["resume_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_status_is_blocked_when_a_revisit_was_flagged() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+    win = {"pid": 1, "window_id": 2}
+    for _ in range(3):
+        await _snap(rail, "get_window_state", win, _WIN_A)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "blocked"
+    assert result["cua_result"]["revisit_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_status_is_completed_with_no_signals() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    result: dict = {"output": "done"}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "completed"
+    assert result["cua_result"]["recommended_recovery"] is None
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_ignores_a_non_dict_result() -> None:
+    # Mirrors every other rail in this file: an optional signal must never
+    # raise into the run.
+    rail = CuaProgressRail(_mcp_cfg())
+    ctx = SimpleNamespace(inputs=SimpleNamespace(result=None), session=_FakeSession())
+
+    await rail.after_invoke(ctx)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_resume_count_increments_across_invocations_on_the_same_session() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    session = _FakeSession()
+
+    first_result: dict = {"output": "1"}
+    await rail.before_invoke(_invoke_ctx(session))
+    await rail.after_invoke(_after_invoke_ctx(first_result, session))
+
+    second_result: dict = {"output": "2"}
+    await rail.before_invoke(_invoke_ctx(session))
+    await rail.after_invoke(_after_invoke_ctx(second_result, session))
+
+    assert first_result["cua_result"]["resume_count"] == 1
+    assert second_result["cua_result"]["resume_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_progress_state_resets_between_invokes() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+    await _snap(rail, "get_window_state", win, _WIN_A)
+    await _snap(rail, "get_window_state", win, _WIN_A)
+
+    await rail.before_invoke(_invoke_ctx())
+
+    ctx = await _snap(rail, "get_window_state", win, _WIN_A)
+    assert "cycling" not in ctx.inputs.tool_msg.content

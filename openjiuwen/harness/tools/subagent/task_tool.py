@@ -55,6 +55,14 @@ _BROWSER_SIMPLE_QUERY_BUDGET_S = 240.0
 _BROWSER_COMPLEX_QUERY_BUDGET_S = 600.0
 _BROWSER_QUERY_RESUME_LIMIT = 1
 
+# Subagent types that support an explicit resume_task_id opt-in instead of a
+# sticky (always-same) sub-session: both are non-sticky by default (see
+# kv_cache_subagent_lifecycle.is_sticky_subagent_type) so two unrelated delegations don't
+# collide into one session, and a caller that deliberately wants the earlier
+# session back (FAIL -> fix -> re-verify) passes the resume_task_id that call
+# returned.
+_EXPLICIT_RESUME_SUBAGENT_TYPES = frozenset({"browser_agent", "cua_agent"})
+
 
 def _summarize_task_description(task_description: Any) -> dict[str, Any]:
     task_text = str(task_description or "")
@@ -144,6 +152,7 @@ class _SubagentInputContext:
     parent_invocation_id: str | None
     affinity_enabled: bool
     browser_query: _BrowserQueryContext | None
+    cua_resume_task_id: str = ""
 
 
 class TaskTool(Tool):
@@ -200,8 +209,11 @@ class TaskTool(Tool):
         normalized_resume_id = str(resume_task_id or "").strip()
         if normalized_resume_id:
             expected_prefix = f"{parent_session_id}_sub_{normalized_type}_"
-            if normalized_type != "browser_agent" or not normalized_resume_id.startswith(expected_prefix):
-                raise ValueError("resume_task_id is not valid for this parent browser task")
+            if (
+                normalized_type not in _EXPLICIT_RESUME_SUBAGENT_TYPES
+                or not normalized_resume_id.startswith(expected_prefix)
+            ):
+                raise ValueError("resume_task_id is not valid for this parent task")
             return normalized_resume_id
         if kv_cache_subagent_lifecycle.is_sticky_subagent_type(normalized_type):
             # Deterministic ID so the session can be resumed on a FAIL → fix → re-verify loop.
@@ -221,6 +233,15 @@ class TaskTool(Tool):
         browser_result = parsed.get("browser_result")
         return dict(browser_result) if isinstance(browser_result, dict) else {}
 
+    @staticmethod
+    def _extract_cua_result(result: Any, output: Any) -> dict[str, Any]:
+        # CuaProgressRail.after_invoke sets this directly on the answer
+        # payload (mirrors authoritative_browser_result above); cua_agent
+        # never round-trips it through the model's own output text.
+        if isinstance(result, dict) and isinstance(result.get("cua_result"), dict):
+            return dict(result["cua_result"])
+        return {}
+
     @classmethod
     def _build_result_data(
         cls,
@@ -232,30 +253,38 @@ class TaskTool(Tool):
         sub_session_id: str,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {"output": output, "agent_id": agent_id}
-        if str(subagent_type) != "browser_agent":
+        normalized_type = str(subagent_type)
+        if normalized_type == "browser_agent":
+            browser_result = cls._extract_browser_result(result, output)
+            data["resume_task_id"] = sub_session_id
+            if not browser_result:
+                return data
+            data["browser_result"] = browser_result
+            data["retryable"] = bool(browser_result.get("retryable"))
+            resume_keys = (
+                "status",
+                "missing_fields",
+                "missing_slots",
+                "requested_slots",
+                "blockers",
+                "evidence",
+                "current_page",
+                "recommended_recovery",
+                "resume_count",
+                "deadline",
+            )
+            data["resume_context"] = {key: browser_result.get(key) for key in resume_keys}
             return data
-        browser_result = cls._extract_browser_result(result, output)
-        data["resume_task_id"] = sub_session_id
-        if not browser_result:
+        if normalized_type == "cua_agent":
+            cua_result = cls._extract_cua_result(result, output)
+            data["resume_task_id"] = sub_session_id
+            if not cua_result:
+                return data
+            data["cua_result"] = cua_result
+            data["retryable"] = cua_result.get("status") != "completed"
+            resume_keys = ("status", "blockers", "current_window", "recommended_recovery", "resume_count")
+            data["resume_context"] = {key: cua_result.get(key) for key in resume_keys}
             return data
-        data["browser_result"] = browser_result
-        data["retryable"] = bool(browser_result.get("retryable"))
-        resume_context: dict[str, Any] = {}
-        resume_keys = (
-            "status",
-            "missing_fields",
-            "missing_slots",
-            "requested_slots",
-            "blockers",
-            "evidence",
-            "current_page",
-            "recommended_recovery",
-            "resume_count",
-            "deadline",
-        )
-        for key in resume_keys:
-            resume_context[key] = browser_result.get(key)
-        data["resume_context"] = resume_context
         return data
 
     @staticmethod
@@ -414,12 +443,15 @@ class TaskTool(Tool):
                 ),
             )
         if normalized_type != "browser_agent":
-            if resume_task_id:
+            if resume_task_id and normalized_type not in _EXPLICIT_RESUME_SUBAGENT_TYPES:
                 raise build_error(
                     StatusCode.TOOL_TASK_TOOL_INVOKED,
-                    reason="'resume_task_id' is supported only for browser_agent",
+                    reason=(
+                        "'resume_task_id' is supported only for "
+                        f"{sorted(_EXPLICIT_RESUME_SUBAGENT_TYPES)}"
+                    ),
                 )
-            return normalized_type, task_description, "", None
+            return normalized_type, task_description, resume_task_id, None
 
         raw_capabilities = inputs.get("browser_capabilities")
         if raw_capabilities is None:
@@ -654,6 +686,11 @@ class TaskTool(Tool):
         }
         if context.browser_query is not None:
             subagent_inputs["run_context"] = TaskTool._browser_run_context(context.browser_query)
+        elif context.cua_resume_task_id:
+            subagent_inputs["run_context"] = {
+                "cua_resume": True,
+                "resume_task_id": context.sub_session_id,
+            }
         if not context.affinity_enabled:
             return subagent_inputs
         subagent_inputs.update(
@@ -771,6 +808,7 @@ class TaskTool(Tool):
         parent_session: Session,
         browser_query: _BrowserQueryContext | None,
         affinity_enabled: bool,
+        cua_resume_task_id: str = "",
     ) -> ToolOutput:
         succeeded = False
         child_session: Session | None = None
@@ -824,6 +862,7 @@ class TaskTool(Tool):
                         parent_invocation_id=parent_invocation_id,
                         affinity_enabled=affinity_enabled,
                         browser_query=browser_query,
+                        cua_resume_task_id=cua_resume_task_id,
                     ),
                 )
                 if child_session is not None:
@@ -983,6 +1022,7 @@ class TaskTool(Tool):
             parent_session=parent_session,
             browser_query=browser_query,
             affinity_enabled=affinity_enabled,
+            cua_resume_task_id=(resume_task_id if normalized_type == "cua_agent" else ""),
         )
 
     async def stream(self, inputs: Input, **kwargs) -> AsyncIterator[Output]:
