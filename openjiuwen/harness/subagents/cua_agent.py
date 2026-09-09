@@ -27,6 +27,7 @@ from openjiuwen.harness.tools.cua.cua_capabilities import (
 from openjiuwen.harness.tools.cua.rails import (
     CuaDeliveryModeRail,
     CuaElementAddressingRail,
+    CuaProgressRail,
     CuaRepeatFailureRail,
     CuaRuntimeRail,
     CuaScreenshotDownscaleRail,
@@ -412,6 +413,10 @@ def create_cua_agent(
         CuaElementAddressingRail(mcp_cfg),
         CuaRepeatFailureRail(mcp_cfg),
         CuaSnapshotFreshnessRail(mcp_cfg),
+        # Must precede CuaSnapshotDedupRail: it needs the driver's raw
+        # response text to fingerprint state revisits, and dedup rewrites
+        # repeat snapshots into a short "unchanged" note in place.
+        CuaProgressRail(mcp_cfg),
         # Rides the same retention knob as the window processor below: the
         # rail must never collapse more consecutive snapshots than the
         # processor keeps in full, or the tree itself leaves context.

@@ -137,6 +137,23 @@ _REPEAT_BLOCKED = (
     "blocked. Repeating this call verbatim will stay blocked."
 )
 
+# CuaProgressRail thresholds -- unlike every other threshold in this file,
+# these are NOT corpus-validated yet: no recorded cua run traces exist for
+# the state-revisit signal. Treat as a reasonable starting point, not a
+# measured constant, until real runs can confirm or retune it.
+_STATE_REVISIT_ADVISE_AFTER = 3
+_STATE_REVISIT_HISTORY_SIZE = 8
+_CUA_BLOCKER_NOTE_MAX = 200
+_CUA_MAX_TRACKED_BLOCKERS = 5
+_CUA_PROGRESS_STATE_KEY = "cua_agent_progress_state"
+
+_STATE_REVISIT_ADVISORY = (
+    "Note: this window's content matches a state you already visited earlier in this run (not "
+    "just the last snapshot -- {revisits} times now). Repeating the same approach is cycling, "
+    "not progressing. Re-snapshot, try a materially different strategy, or report what is "
+    "blocking you instead of continuing the same sequence."
+)
+
 
 class CuaRuntimeRail(AgentRail):
     """Lifecycle rail for the cua-driver MCP runtime.
@@ -869,9 +886,180 @@ class CuaRepeatFailureRail(AgentRail):
         inputs.tool_msg = ToolMessage(content=error_msg, tool_call_id=tool_call_id)
 
 
+class CuaProgressRail(AgentRail):
+    """Track coarse desktop-state revisits and surface a resume_context to the caller.
+
+    Two signals, both provisional -- unlike every other rail in this file,
+    no recorded cua run corpus validates these thresholds yet:
+
+    1. State-revisit loop detection. CuaSnapshotDedupRail already collapses
+       a snapshot that is byte-identical to the IMMEDIATELY PRECEDING one of
+       the same window. That misses cycling back to a state seen several
+       actions ago (dialog A -> dialog B -> dialog A), where the
+       intervening snapshot(s) differ so nothing collapses. This rail keeps
+       a short bounded history of content digests per (pid, window_id) --
+       normalized the same way CuaSnapshotDedupRail is, by stripping the
+       fields the driver regenerates every call -- and appends a replan
+       advisory once a digest reappears often enough.
+
+       Must run BEFORE CuaSnapshotDedupRail in the rail list (enforced by
+       injection order in create_cua_agent(), not priority -- this file's
+       cua rails all use the default priority) so it always sees the
+       driver's raw response text. After dedup collapses a repeat into its
+       short "unchanged" note, that note's digest would no longer match the
+       original content's digest and revisits would silently stop being
+       tracked.
+
+    2. resume_context reporting. At run end (after_invoke) this rail
+       packages what it tracked -- current window, accumulated blockers,
+       revisit count, a resume counter persisted in session state across
+       delegations -- into ``result["cua_result"]``, mirroring how
+       browser_agent's runtime attaches ``authoritative_browser_result``.
+       task_tool.py reads this back and surfaces it to the delegating
+       parent as ``resume_context``, same shape/purpose as browser's but
+       with cua-appropriate fields (no DOM concepts like missing_fields or
+       current_page). ``status``/``recommended_recovery`` here are simple
+       heuristics derived from whether a blocker or the revisit threshold
+       was hit -- not an authoritative task-completion judgment the way
+       browser's phase-tracked status is.
+    """
+
+    def __init__(self, mcp_cfg: McpServerConfig) -> None:
+        super().__init__()
+        self._tool_prefix = mcp_model_tool_prefix(mcp_cfg.server_name)
+        # (short_name, pid, window_id) -> deque of recent content digests.
+        self._history: dict = {}
+        # (key, digest) -> times that digest has been seen for that key.
+        self._revisit_counts: dict = {}
+        self._advised: set = set()
+        self._current_window: Optional[dict] = None
+        self._blockers: list = []
+
+    async def before_invoke(self, ctx: AgentCallbackContext) -> None:
+        self._history = {}
+        self._revisit_counts = {}
+        self._advised = set()
+        self._current_window = None
+        self._blockers = []
+
+    async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
+        inputs = ctx.inputs
+        if not isinstance(inputs, ToolCallInputs):
+            return
+        tool_name = str(inputs.tool_name or "")
+        if not tool_name.startswith(self._tool_prefix):
+            return
+        if ctx.extra.get("_skip_tool"):
+            # A rail-side rejection never reached the driver.
+            return
+        short_name = tool_name[len(self._tool_prefix) :]
+        response = _response_text(inputs)
+
+        if short_name in _SNAPSHOT_TOOLS:
+            args, _ = _normalize_tool_args(inputs.tool_args)
+            if args is None:
+                return
+            pid, window_id = args.get("pid"), args.get("window_id")
+            if pid is not None or window_id is not None:
+                self._current_window = {"pid": pid, "window_id": window_id}
+            # Same usable-baseline gate as CuaSnapshotDedupRail: a failed or
+            # non-textual snapshot carries no tree content to fingerprint.
+            if response and ("element_index" in response or "element_count" in response):
+                self._track_revisit(inputs, short_name, pid, window_id, response)
+            return
+        if short_name in _FRESHNESS_NEUTRAL_TOOLS:
+            return
+
+        # Action tool: absence of the driver success marker signals a blocker.
+        # (Snapshot/freshness-neutral tools never carry the marker even on
+        # success, which is why they are excluded above rather than checked.)
+        if response is not None and not response.startswith(_DRIVER_SUCCESS_MARKER):
+            self._note_blocker(short_name, response)
+
+    def _track_revisit(
+        self,
+        inputs: ToolCallInputs,
+        short_name: str,
+        pid: Any,
+        window_id: Any,
+        response: str,
+    ) -> None:
+        comparable = _SNAPSHOT_VOLATILE_FIELD_RE.sub(r"\1<volatile>", response)
+        comparable = _SNAPSHOT_IMAGE_PLACEHOLDER_RE.sub("[image content: <volatile>]", comparable)
+        digest = hashlib.sha256(comparable.encode("utf-8")).hexdigest()
+        key = (short_name, pid, window_id)
+        history = self._history.setdefault(key, collections.deque(maxlen=_STATE_REVISIT_HISTORY_SIZE))
+
+        if digest not in history:
+            history.append(digest)
+            return
+
+        revisit_key = (key, digest)
+        count = self._revisit_counts.get(revisit_key, 1) + 1
+        self._revisit_counts[revisit_key] = count
+        if count >= _STATE_REVISIT_ADVISE_AFTER and revisit_key not in self._advised:
+            self._advised.add(revisit_key)
+            logger.info(
+                "[CuaProgressRail] Detected %d revisits to the same state for pid=%r window_id=%r",
+                count,
+                pid,
+                window_id,
+            )
+            _append_advisory(inputs, _STATE_REVISIT_ADVISORY.format(revisits=count))
+
+    def _note_blocker(self, short_name: str, response: str) -> None:
+        if len(self._blockers) >= _CUA_MAX_TRACKED_BLOCKERS:
+            return
+        stripped = response.strip()
+        if not stripped:
+            return
+        entry = f"{short_name}: {stripped.splitlines()[0][:_CUA_BLOCKER_NOTE_MAX]}"
+        if entry not in self._blockers:
+            self._blockers.append(entry)
+
+    async def after_invoke(self, ctx: AgentCallbackContext) -> None:
+        result = getattr(getattr(ctx, "inputs", None), "result", None)
+        if not isinstance(result, dict):
+            return
+
+        resume_count = 0
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            try:
+                state = session.get_state(_CUA_PROGRESS_STATE_KEY)
+                resume_count = int(state.get("resume_count", 0)) + 1 if isinstance(state, dict) else 1
+                session.update_state({_CUA_PROGRESS_STATE_KEY: {"resume_count": resume_count}})
+            except Exception as exc:
+                # Best-effort: an optional resume counter must never block the run.
+                logger.debug("[CuaProgressRail] resume_count tracking failed: %s", exc)
+
+        if self._advised:
+            status = "blocked"
+            recovery = (
+                "Task appears to be cycling through the same desktop state; retry with a "
+                "materially different approach or escalate delivery_mode."
+            )
+        elif self._blockers:
+            status = "partial"
+            recovery = "Some actions did not report success; re-snapshot and verify before retrying."
+        else:
+            status = "completed"
+            recovery = None
+
+        result["cua_result"] = {
+            "status": status,
+            "current_window": self._current_window,
+            "blockers": list(self._blockers),
+            "revisit_count": max(self._revisit_counts.values(), default=0),
+            "recommended_recovery": recovery,
+            "resume_count": resume_count,
+        }
+
+
 __all__ = [
     "CuaDeliveryModeRail",
     "CuaElementAddressingRail",
+    "CuaProgressRail",
     "CuaRepeatFailureRail",
     "CuaRuntimeRail",
     "CuaScreenshotDownscaleRail",

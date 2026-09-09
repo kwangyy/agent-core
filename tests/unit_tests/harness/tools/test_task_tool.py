@@ -598,6 +598,133 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.data["browser_result"]["status"], "completed")
         self.assertEqual(third.data["code"], "browser_query_resume_not_allowed")
 
+    async def test_task_tool_creates_fresh_cua_model_session(self) -> None:
+        called_inputs: dict[str, str] = {}
+
+        class FakeSubAgent:
+            def __init__(self):
+                self.card = AgentCard(name="test_agent", description="test", id="test_id")
+
+            async def invoke(self, inputs: dict[str, str]) -> dict[str, str]:
+                called_inputs.update(inputs)
+                return {"output": "done"}
+
+        cua_spec = SubAgentConfig(
+            agent_card=AgentCard(name="cua_agent", description="cua subagent"),
+            system_prompt="sub",
+        )
+        parent_agent = DeepAgent(AgentCard(name="parent", description="test"))
+        parent_agent.configure(
+            DeepAgentConfig(
+                system_prompt="parent",
+                subagents=[cua_spec],
+                tools=[],
+                mcps=[],
+                model=None,
+                skills=[],
+            )
+        )
+
+        card = ToolCard(id="task_tool_test", name="task_tool", description="test")
+        tool = TaskTool(card=card, parent_agent=parent_agent)
+
+        session = Session(session_id="parent_session")
+        with patch.object(parent_agent, "create_subagent", return_value=FakeSubAgent()) as mock_create_subagent:
+            result = await tool.invoke(
+                {
+                    "subagent_type": "cua_agent",
+                    "task_description": "open notepad and type hello",
+                },
+                session=session,
+            )
+
+        self.assertTrue(result.success)
+        cua_session_id = called_inputs["conversation_id"]
+        self.assertRegex(cua_session_id, r"^parent_session_sub_cua_agent_[0-9a-f]{8}$")
+        self.assertEqual(result.data["resume_task_id"], cua_session_id)
+        mock_create_subagent.assert_called_once_with("cua_agent", cua_session_id)
+
+    def test_cua_session_can_resume_only_with_returned_parent_scoped_id(self) -> None:
+        resume_id = "parent_session_sub_cua_agent_1234abcd"
+        self.assertEqual(
+            TaskTool._build_sub_session_id(
+                "parent_session",
+                "cua_agent",
+                resume_id,
+            ),
+            resume_id,
+        )
+        with self.assertRaisesRegex(ValueError, "not valid"):
+            TaskTool._build_sub_session_id(
+                "another_parent",
+                "cua_agent",
+                resume_id,
+            )
+
+    async def test_cua_resume_passes_structured_context_and_result_metadata(self) -> None:
+        called_inputs: dict[str, object] = {}
+        cua_result = {
+            "status": "blocked",
+            "current_window": {"pid": 4242, "window_id": "w1"},
+            "blockers": ["type_text: element not found"],
+            "revisit_count": 3,
+            "recommended_recovery": (
+                "Task appears to be cycling through the same desktop state; retry with a "
+                "materially different approach or escalate delivery_mode."
+            ),
+            "resume_count": 1,
+        }
+
+        class FakeSubAgent:
+            def __init__(self):
+                self.card = AgentCard(name="test_agent", description="test", id="test_id")
+
+            async def invoke(self, inputs: dict[str, object]) -> dict[str, object]:
+                called_inputs.update(inputs)
+                return {"output": "still working on it", "cua_result": cua_result}
+
+        cua_spec = SubAgentConfig(
+            agent_card=AgentCard(name="cua_agent", description="cua subagent"),
+            system_prompt="sub",
+        )
+        parent_agent = DeepAgent(AgentCard(name="parent", description="test"))
+        parent_agent.configure(
+            DeepAgentConfig(
+                system_prompt="parent",
+                subagents=[cua_spec],
+                tools=[],
+                mcps=[],
+                model=None,
+                skills=[],
+            )
+        )
+        tool = TaskTool(
+            card=ToolCard(id="task_tool_test", name="task_tool", description="test"),
+            parent_agent=parent_agent,
+        )
+        resume_id = "parent_session_sub_cua_agent_1234abcd"
+
+        with patch.object(parent_agent, "create_subagent", return_value=FakeSubAgent()):
+            result = await tool.invoke(
+                {
+                    "subagent_type": "cua_agent",
+                    "task_description": "keep trying to close the dialog",
+                    "resume_task_id": resume_id,
+                },
+                session=Session(session_id="parent_session"),
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(called_inputs["conversation_id"], resume_id)
+        self.assertEqual(
+            called_inputs["run_context"],
+            {"cua_resume": True, "resume_task_id": resume_id},
+        )
+        self.assertTrue(result.data["retryable"])
+        self.assertEqual(result.data["cua_result"], cua_result)
+        self.assertEqual(result.data["resume_context"]["blockers"], cua_result["blockers"])
+        self.assertEqual(result.data["resume_context"]["current_window"], cua_result["current_window"])
+
 
 class TestTaskToolSync(unittest.TestCase):
     def test_sub_session_id_deterministic_for_resumable_subagents(self) -> None:
@@ -607,7 +734,8 @@ class TestTaskToolSync(unittest.TestCase):
         and cua_agent are intentionally excluded: their session/driver state is owned
         by a service registry outside the model session, and a sticky model session
         here would leak an earlier, unrelated delegation's context into a fresh
-        TaskTool call.
+        TaskTool call. Both instead offer an explicit resume_task_id opt-in (see
+        _EXPLICIT_RESUME_SUBAGENT_TYPES) for the one case that still wants continuity.
         """
         for resumable in ("verification_agent",):
             self.assertEqual(
