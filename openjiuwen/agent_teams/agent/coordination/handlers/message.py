@@ -659,6 +659,11 @@ class MessageHandler(BaseCoordinationHandler):
         user_action_key = "required" if failure.user_action_required else "not_identified"
         user_action_guidance = t(f"reliability.user_action.{user_action_key}")
         empty_field = "<none>"
+        cli_path_diagnostic = (
+            t("reliability.external_runtime_cli_path", cli_path=failure.cli_path)
+            if failure.cli_path
+            else ""
+        )
         body = t(
             "reliability.external_runtime_failed",
             member_name=failure.member_name,
@@ -675,6 +680,7 @@ class MessageHandler(BaseCoordinationHandler):
             http_status=failure.reason.http_status if failure.reason.http_status is not None else empty_field,
             sdk_error_type=failure.reason.sdk_error_type or empty_field,
             sdk_error_code=failure.reason.sdk_error_code or empty_field,
+            cli_path_diagnostic=cli_path_diagnostic,
             phase_guidance=phase_guidance,
             user_action_guidance=user_action_guidance,
         )

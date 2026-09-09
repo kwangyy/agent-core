@@ -307,15 +307,16 @@ class CodexSdkRuntime(CliRuntimeBase):
             leader_name=leader_name,
             update_status_cb=update_status_cb,
             span_bridge=self._span_bridge,
+            cli_path=getattr(self._config, "codex_bin", None),
         )
 
     async def start(self, *, team_session: Any | None = None) -> None:
         """Restore the member checkpoint, then create or resume its SDK thread."""
         await super().start(team_session=team_session)
-        self._restore_thread_id()
         if self._reliability_ctx is not None:
             self._reliability_ctx.begin_attempt(phase="startup", round_id=None)
         try:
+            self._restore_thread_id()
             await self._ensure_thread()
         except BaseException as exc:
             await self._finalize_startup_failure(exc)
@@ -424,8 +425,9 @@ class CodexSdkRuntime(CliRuntimeBase):
 
         The member AgentSession itself is opened by ``CliRuntimeBase.start``;
         Codex only reads its own slice back out. It is stricter than the base
-        about that session existing, because without it a resume cannot tell an
-        interrupted thread from a fresh one.
+        about that session existing. A saved id must be resumed strictly; when
+        no id was ever saved there is no resumable target, so recovery starts a
+        new thread instead.
         """
         member_session = self._member_session
         if member_session is None:
@@ -436,11 +438,11 @@ class CodexSdkRuntime(CliRuntimeBase):
         self._persisted_thread_id = restored_thread_id
         if self._resume_external_backend:
             if restored_thread_id is None:
-                raise RuntimeError(
-                    f"cannot resume Codex member {self._member_name!r} without a saved "
-                    "external_session_id in its member checkpoint; strict resume "
-                    "forbids starting a replacement thread",
+                team_logger.warning(
+                    "[external-cli] member {} has no saved Codex thread; starting a new thread",
+                    self._member_name,
                 )
+                return
             self._thread_id = restored_thread_id
 
     @staticmethod

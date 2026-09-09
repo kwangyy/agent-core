@@ -90,6 +90,20 @@ def test_false_user_action_is_not_rendered_as_definitive(_lang):
     assert "后续仍可能需要用户介入" in text
 
 
+def test_explicit_cli_path_is_rendered_but_missing_path_is_omitted(_lang: None) -> None:
+    with_path = MessageHandler._render_external_runtime_failed(
+        _Msg(protocol="json", content=_failure_payload(cli_path="C:/tools/codex.exe")),
+    )
+    without_path = MessageHandler._render_external_runtime_failed(
+        _Msg(protocol="json", content=_failure_payload()),
+    )
+
+    assert with_path is not None
+    assert "cli_path=C:/tools/codex.exe" in with_path
+    assert without_path is not None
+    assert "cli_path=" not in without_path
+
+
 def test_non_json_returns_none(_lang):
     assert MessageHandler._render_external_runtime_failed(_Msg(protocol="plain", content="hi")) is None
 

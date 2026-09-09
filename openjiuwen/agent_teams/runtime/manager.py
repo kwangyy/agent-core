@@ -250,6 +250,7 @@ class TeamRuntimeManager:
             MemberStatus.STOPPED,
             MemberStatus.PAUSED,
             MemberStatus.SHUTDOWN,
+            MemberStatus.ERROR,
         }
     )
 
@@ -268,7 +269,8 @@ class TeamRuntimeManager:
 
         When ``team_member`` is already in
         :data:`_MEMBER_FINALIZED_STATUSES` someone else has written the
-        outcome (leader's ``_mark_live_teammates`` or ``shutdown_self``),
+        outcome (leader's ``_mark_live_teammates``, ``shutdown_self``, or a
+        runtime failure reporter),
         so we only tear down the kernel and skip the status write entirely.
         """
         member = agent.team_member
@@ -291,8 +293,8 @@ class TeamRuntimeManager:
                 await kv_cache_hooks.evict_member(agent, reason="member-shutdown")
 
             if already_finalized:
-                # External party (leader stop/pause, shutdown_self) already
-                # wrote a terminal/quiescent status. Just close the kernel.
+                # Another lifecycle owner already wrote the persisted outcome.
+                # Just close the kernel without erasing STOPPED/PAUSED/ERROR.
                 team_logger.info(
                     "finalize_member: team member {} already finalized (status={}); closing kernel only",
                     member_name,

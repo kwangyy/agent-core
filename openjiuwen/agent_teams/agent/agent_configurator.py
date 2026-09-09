@@ -9,6 +9,7 @@ import os
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     Optional,
 )
@@ -251,10 +252,12 @@ class AgentConfigurator:
         spec: TeamAgentSpec,
         ctx: TeamRuntimeContext,
         *,
-        on_teammate_created=None,
-        on_before_team_cleaned=None,
-        on_team_cleaned=None,
-        on_team_built=None,
+        on_teammate_created: Callable[[str], Awaitable[None]] | None = None,
+        on_teammate_restarted: Callable[[str], Awaitable[bool]] | None = None,
+        on_teammate_stopped: Callable[[str], Awaitable[None]] | None = None,
+        on_before_team_cleaned: Callable[[], Awaitable[None]] | None = None,
+        on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
+        on_team_built: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Phase 1: set spec/context, create messager, workspace manager, prepare team backend."""
         agent_spec = self.resolve_agent_spec(spec, ctx.role, ctx.member_name)
@@ -302,6 +305,8 @@ class AgentConfigurator:
             on_before_team_cleaned=on_before_team_cleaned,
             on_team_cleaned=on_team_cleaned,
             on_team_built=on_team_built,
+            on_member_restarted=on_teammate_restarted,
+            on_member_stopped=on_teammate_stopped,
         )
 
         if ctx.role == TeamRole.LEADER and spec.worktree and spec.worktree.enabled:
@@ -958,9 +963,11 @@ class AgentConfigurator:
         ctx: TeamRuntimeContext,
         messager: Messager,
         *,
-        on_before_team_cleaned=None,
-        on_team_cleaned=None,
-        on_team_built=None,
+        on_before_team_cleaned: Callable[[], Awaitable[None]] | None = None,
+        on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
+        on_team_built: Callable[[], Awaitable[None]] | None = None,
+        on_member_restarted: Callable[[str], Awaitable[bool]] | None = None,
+        on_member_stopped: Callable[[str], Awaitable[None]] | None = None,
     ) -> TeamBackend:
         """Construct the TeamBackend and register cleanup paths.
 
@@ -980,6 +987,10 @@ class AgentConfigurator:
             on_team_built: Optional async callback threaded into the
                 ``TeamBackend`` so the hosting ``TeamAgent`` can persist
                 DB lifecycle state after ``build_team`` succeeds.
+            on_member_restarted: Optional async callback used to rebuild a
+                member runtime after ERROR is claimed for recovery.
+            on_member_stopped: Optional async callback used to clean a stale
+                runtime handle when an ERROR member is shut down directly.
         """
         from openjiuwen.agent_teams.schema.status import MemberMode
         from openjiuwen.agent_teams.spawn.shared_resources import get_shared_db
@@ -1025,6 +1036,8 @@ class AgentConfigurator:
             on_team_cleaned=on_team_cleaned,
             on_team_built=on_team_built,
             on_member_started=self._on_teammate_created,
+            on_member_restarted=on_member_restarted,
+            on_member_stopped=on_member_stopped,
             leader_member_name=ctx.team_spec.leader_member_name if ctx.team_spec else None,
         )
 

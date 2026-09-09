@@ -322,6 +322,10 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
     成功**之后**拉起——任务已经在板上，才谈得上有人来领）。该方法持有构造期注入的
     `on_member_started` 回调并自带 leader 门与回调门，**调用方不再各自捎带 spawn 回调**；
     幂等由下层 `startup_member` 的 CAS 保证。
+    单播/多播的具体收件人若是 `ERROR`，这次定向投递本身构成显式恢复请求：写库前经
+    `recover_member` 的 `ERROR→RESTARTING` CAS 重建 runtime；广播不批量恢复 ERROR，避免
+    一条泛化消息触发全队 restart storm。ERROR runtime 已经退出时，`shutdown_member` 则直接
+    CAS 到 `SHUTDOWN` 并清理 stale handle，不发送一个永远不会被消费的 shutdown event。
     两点边界：**scheduled 的 `create_task` 不拉人**（交接归 `TeamScheduler`，工具再插一手
     就是双投递，所以差异由 `ScheduledTaskCreateTool` 这个独立类吸收，不是 `invoke` 里的
     模式分支）；**拉起失败不改变工具的成败**——任务/消息已落库，报失败只会诱使模型重建一遍，

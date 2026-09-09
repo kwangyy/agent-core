@@ -21,7 +21,10 @@ import pytest
 from openjiuwen.agent_teams.external.cli_agent.claude import runtime as claude_runtime_mod
 from openjiuwen.agent_teams.external.cli_agent.claude.runtime import ClaudeSdkRuntime
 from openjiuwen.agent_teams.harness.state import HarnessState
-from openjiuwen.agent_teams.schema.external_runtime_reliability import ExternalRuntimeFailure
+from openjiuwen.agent_teams.schema.external_runtime_reliability import (
+    ExternalRuntimeFailure,
+    ExternalRuntimeFailureReason,
+)
 from openjiuwen.agent_teams.schema.status import MemberStatus
 from tests.test_logger import logger
 
@@ -209,6 +212,32 @@ def _make_runtime(sdk: Any, *, turn_idle_timeout_s: float = 600.0) -> ClaudeSdkR
         member_agent_id="agent_worker1",
         turn_idle_timeout_s=turn_idle_timeout_s,
     )
+
+
+@pytest.mark.asyncio
+async def test_claude_reliability_context_reports_configured_cli_path() -> None:
+    runtime = _make_runtime(SimpleNamespace())
+    runtime._options.cli_path = "/opt/claude"
+    mm = _FakeMessageManager()
+    messager = _FakeMessager()
+    sink = _StatusSink()
+    runtime.bind_reliability_context(
+        session_id="session",
+        team_backend=SimpleNamespace(team_name="team", message_manager=mm),
+        leader_name="leader",
+        update_status_cb=sink,
+        messager=messager,
+    )
+    runtime._reliability_ctx.begin_attempt(phase="startup", round_id=None)
+
+    await runtime._reliability_ctx.finalize_failure(
+        category="process_start_failed",
+        reason=ExternalRuntimeFailureReason(message="failed"),
+        summary="startup failed",
+    )
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.cli_path == "/opt/claude"
 
 
 @pytest.mark.asyncio

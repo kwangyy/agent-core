@@ -13,6 +13,7 @@ import pytest
 from openjiuwen.agent_teams.external.cli_agent.codex.runtime import CodexSdkRuntime
 from openjiuwen.agent_teams.schema.external_runtime_reliability import (
     ExternalRuntimeFailure,
+    ExternalRuntimeFailureReason,
 )
 from tests.test_logger import logger
 
@@ -160,6 +161,29 @@ def _build_runtime(turn_notifications) -> tuple[CodexSdkRuntime, _FakeMessageMan
 
 async def _start(runtime):
     await runtime.start(team_session=runtime._test_team_session)
+
+
+@pytest.mark.asyncio
+async def test_codex_reliability_context_reports_configured_cli_path() -> None:
+    runtime, mm, messager, sink = _build_runtime([])
+    runtime._config.codex_bin = "/opt/codex"
+    runtime.bind_reliability_context(
+        session_id="session",
+        team_backend=SimpleNamespace(team_name="team", message_manager=mm),
+        leader_name="leader",
+        update_status_cb=sink,
+        messager=messager,
+    )
+    runtime._reliability_ctx.begin_attempt(phase="startup", round_id=None)
+
+    await runtime._reliability_ctx.finalize_failure(
+        category="process_start_failed",
+        reason=ExternalRuntimeFailureReason(message="failed"),
+        summary="startup failed",
+    )
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.cli_path == "/opt/codex"
 
 
 @pytest.mark.asyncio
@@ -490,6 +514,26 @@ async def test_codex_startup_auth_exception_does_not_activate_fallback():
     assert fallback_client.start_calls == []
     assert fallback_client.resume_calls == []
     assert runtime._fallback_activated is False
+
+
+@pytest.mark.asyncio
+async def test_codex_checkpoint_restore_failure_is_reported_as_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, mm, _messager, sink = _build_runtime([])
+
+    def fail_restore() -> None:
+        raise RuntimeError("checkpoint unavailable")
+
+    monkeypatch.setattr(runtime, "_restore_thread_id", fail_restore)
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await _start(runtime)
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.phase == "startup"
+    assert failure.reason.message == "checkpoint unavailable"
+    assert [status.value for status in sink.statuses] == ["error"]
 
 
 @pytest.mark.asyncio

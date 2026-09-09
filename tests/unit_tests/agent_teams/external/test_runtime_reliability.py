@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from openjiuwen.agent_teams.schema.status import MemberStatus
@@ -58,7 +59,12 @@ class _StatusSink:
         self.statuses.append(status)
 
 
-def _build_ctx(*, message_manager=None, messager=None) -> RuntimeReliabilityContext:
+def _build_ctx(
+    *,
+    message_manager: Any = None,
+    messager: Any = None,
+    cli_path: str | None = None,
+) -> RuntimeReliabilityContext:
     return RuntimeReliabilityContext(
         member_name="worker1",
         team_name="team",
@@ -68,6 +74,7 @@ def _build_ctx(*, message_manager=None, messager=None) -> RuntimeReliabilityCont
         messager=messager,
         leader_name="leader",
         update_status_cb=_StatusSink() if messager is not None else _StatusSink(),  # type: ignore[arg-type]
+        cli_path=cli_path,
     )
 
 
@@ -92,6 +99,36 @@ async def test_finalize_failure_persists_one_message():
     assert len(mm.sent) == 1
     assert mm.sent[0]["to"] == "leader"
     assert mm.sent[0]["protocol"] == "json"
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_reports_explicit_cli_path_only_when_configured() -> None:
+    configured_mm = _FakeMessageManager()
+    configured = _build_ctx(
+        message_manager=configured_mm,
+        messager=_FakeMessager(),
+        cli_path=" /opt/codex ",
+    )
+    configured.begin_attempt(phase="startup", round_id=None)
+    configured_failure = await configured.finalize_failure(
+        category="process_start_failed",
+        reason=ExternalRuntimeFailureReason(message="failed"),
+        summary="startup failed",
+    )
+
+    default_mm = _FakeMessageManager()
+    default = _build_ctx(message_manager=default_mm, messager=_FakeMessager())
+    default.begin_attempt(phase="startup", round_id=None)
+    await default.finalize_failure(
+        category="process_start_failed",
+        reason=ExternalRuntimeFailureReason(message="failed"),
+        summary="startup failed",
+    )
+
+    assert configured_failure is not None
+    assert configured_failure.cli_path == "/opt/codex"
+    assert json.loads(configured_mm.sent[0]["content"])["cli_path"] == "/opt/codex"
+    assert "cli_path" not in json.loads(default_mm.sent[0]["content"])
 
 
 @pytest.mark.asyncio

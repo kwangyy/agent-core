@@ -82,6 +82,7 @@ class RuntimeReliabilityContext:
         leader_name: str,
         update_status_cb: UpdateStatusCallback,
         span_bridge: Any = None,
+        cli_path: str | None = None,
     ) -> None:
         """Bind the delivery and status surface for one member runtime."""
         self._member_name = member_name
@@ -93,6 +94,8 @@ class RuntimeReliabilityContext:
         self._leader_name = leader_name
         self._update_status_cb = update_status_cb
         self._span_bridge = span_bridge
+        normalized_cli_path = str(cli_path).strip() if cli_path is not None else ""
+        self._cli_path = normalized_cli_path or None
         self._model = ""
         # Per-attempt state; see begin_attempt.
         self._phase: Optional[ExternalRuntimePhase] = None
@@ -278,6 +281,7 @@ class RuntimeReliabilityContext:
             member_name=self._member_name,
             agent_kind=self._agent_kind,
             model=self._model,
+            cli_path=self._cli_path,
             phase=self._phase or "turn",
             category=category,
             user_action_required=user_action_required(category),
@@ -300,7 +304,8 @@ class RuntimeReliabilityContext:
                 failure.summary,
             )
             return
-        content = failure.model_dump_json()
+        excluded_fields = {"cli_path"} if failure.cli_path is None else None
+        content = failure.model_dump_json(exclude=excluded_fields)
         try:
             await self._message_manager.send_message(
                 content=content,
@@ -315,11 +320,13 @@ class RuntimeReliabilityContext:
                 failure.failure_id,
             )
         team_logger.error(
-            "[external-runtime] member {} {} failed model={} phase={} category={} failure_id={} round_id={} "
+            "[external-runtime] member {} {} failed model={} cli_path={} phase={} category={} "
+            "failure_id={} round_id={} "
             "summary={} user_action_required={}",
             self._member_name,
             self._agent_kind,
             failure.model or "<unknown>",
+            failure.cli_path or "<default>",
             failure.phase,
             failure.category,
             failure.failure_id,

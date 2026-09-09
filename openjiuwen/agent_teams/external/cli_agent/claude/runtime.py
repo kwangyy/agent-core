@@ -151,6 +151,7 @@ class ClaudeSdkRuntime(CliRuntimeBase):
             leader_name=leader_name,
             update_status_cb=update_status_cb,
             span_bridge=self._span_bridge,
+            cli_path=getattr(self._options, "cli_path", None),
         )
 
     def _install_stderr_callback(self) -> None:

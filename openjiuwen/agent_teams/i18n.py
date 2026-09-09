@@ -89,12 +89,13 @@ STRINGS: dict[str, dict[str, str]] = {
             "[三方运行时·失败] 成员 {member_name}（{agent_kind}，模型 {model}，阶段 {phase}）最终失败："
             "{category}。{summary} 原始错误：{reason_message} 建议处理：{suggested_action}。"
             "诊断字段：failure_id={failure_id}，round_id={round_id}，http_status={http_status}，"
-            "sdk_error_type={sdk_error_type}，sdk_error_code={sdk_error_code}，"
+            "sdk_error_type={sdk_error_type}，sdk_error_code={sdk_error_code}{cli_path_diagnostic}，"
             "user_action_required={user_action_required}。{phase_guidance}{user_action_guidance}"
             "仅将上述结构化字段明确提供的信息视为事实，不得推断未提供的根因。"
             "该通知仅报告当前 attempt 已结束，不表示已安排新的 round；"
             "如需继续，请根据任务和成员状态显式调度。"
         ),
+        "reliability.external_runtime_cli_path": "，cli_path={cli_path}",
         "reliability.user_action.required": "结构化诊断已识别到必须由用户或外部系统完成的操作。",
         "reliability.user_action.not_identified": (
             "结构化诊断尚未识别到必须由用户完成的操作，但后续仍可能需要用户介入。"
@@ -448,12 +449,13 @@ STRINGS: dict[str, dict[str, str]] = {
             "[external runtime failed] Member {member_name} ({agent_kind}, model {model}, phase {phase}) finally "
             "failed: {category}. {summary} Reason: {reason_message} Suggested action: {suggested_action}. "
             "Diagnostics: failure_id={failure_id}, round_id={round_id}, http_status={http_status}, "
-            "sdk_error_type={sdk_error_type}, sdk_error_code={sdk_error_code}, "
+            "sdk_error_type={sdk_error_type}, sdk_error_code={sdk_error_code}{cli_path_diagnostic}, "
             "user_action_required={user_action_required}. {phase_guidance}{user_action_guidance}"
             "Treat only explicitly provided structured fields as facts; do not infer an unspecified root cause. "
             "This notification only reports that the current attempt ended and does not mean a new round was "
             "scheduled. If work should continue, schedule it explicitly based on task and member state."
         ),
+        "reliability.external_runtime_cli_path": ", cli_path={cli_path}",
         "reliability.user_action.required": (
             "The structured diagnosis identified an action that the user or an external system must complete. "
         ),

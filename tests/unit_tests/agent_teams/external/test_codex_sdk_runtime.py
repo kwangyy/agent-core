@@ -1269,23 +1269,31 @@ async def test_codex_sdk_runtime_does_not_rewrite_restored_thread_id():
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_codex_sdk_runtime_strict_resume_rejects_missing_member_checkpoint():
+async def test_codex_sdk_runtime_recovery_starts_thread_without_saved_checkpoint():
     thread = _FakeThread("thread-new", [[]])
     runtime, client = _runtime(thread=thread)
     runtime._resume_external_backend = True
 
-    with pytest.raises(RuntimeError, match="strict resume forbids"):
-        await _start(runtime)
+    await _start(runtime)
 
-    assert client.start_calls == []
+    assert client.start_calls == [
+        {
+            "config": {"model_reasoning_summary": "detailed"},
+            "cwd": "/workspace",
+            "developer_instructions": "role prompt",
+            "ephemeral": False,
+            "experimental_raw_events": True,
+        }
+    ]
     assert client.resume_calls == []
+    assert runtime._test_member_session.state == _saved_state("thread-new")
 
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_codex_sdk_runtime_ignores_other_backend_checkpoint_on_strict_resume():
+async def test_codex_sdk_runtime_recovery_starts_thread_for_other_backend_checkpoint():
     thread = _FakeThread("thread-new", [[]])
-    runtime, _ = _runtime(
+    runtime, client = _runtime(
         thread=thread,
         member_state={
             "external_runtime": {
@@ -1296,8 +1304,11 @@ async def test_codex_sdk_runtime_ignores_other_backend_checkpoint_on_strict_resu
     )
     runtime._resume_external_backend = True
 
-    with pytest.raises(RuntimeError, match="strict resume forbids"):
-        await _start(runtime)
+    await _start(runtime)
+
+    assert client.resume_calls == []
+    assert len(client.start_calls) == 1
+    assert runtime._test_member_session.state == _saved_state("thread-new")
 
 
 @pytest.mark.asyncio
