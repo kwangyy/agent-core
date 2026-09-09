@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from openjiuwen.agent_teams.paths import configure_openjiuwen_home, reset_openjiuwen_home
 from openjiuwen.core.common.logging import logger
+from openjiuwen.rsi.harness_rsi.data_loader.case_files import task_input
 from openjiuwen.rsi.harness_rsi.evaluator.case_backend import (
     CaseExecutionBackend,
     CaseExecutionResult,
@@ -24,11 +25,13 @@ from openjiuwen.rsi.harness_rsi.evaluator.case_backend import (
 )
 from openjiuwen.rsi.harness_rsi.evaluator.errors import EvaluationInfrastructureError
 from openjiuwen.rsi.harness_rsi.evaluator.judger import EvaluationJudger, JudgeResult
+from openjiuwen.rsi.harness_rsi.evaluator.judger.base import _is_execution_only_evaluation
 from openjiuwen.rsi.harness_rsi.evaluator.trajectory_paths import (
     ROLE_TRAJECTORY_DIR_NAME,
     TRAJECTORY_EVENTS_FILE_NAME,
 )
 from openjiuwen.rsi.harness_rsi.schema import EvaluationCaseTraceRef
+from openjiuwen.rsi.usage import model_usage_stage
 
 _MAX_ROLE_TRAJECTORY_FILE_BYTES = 2_000_000
 _ROLE_TRAJECTORY_TAIL_BYTES = 64_000
@@ -267,6 +270,10 @@ class CaseRunner:
         except Exception as exc:
             if isinstance(exc, EvaluationInfrastructureError):
                 body_error = exc
+                _write_json(
+                    case_dir / "evaluation_error.json",
+                    {"case_id": case_id, "status": "error", "score": None, "error": str(exc)},
+                )
                 raise
             body_error = exc
             return _write_error_case_artifacts(
@@ -294,6 +301,7 @@ class CaseRunner:
                 _cleanup_scratch(case_dir, runtime_home_dir)
                 reset_openjiuwen_home()
 
+    @model_usage_stage("judge")
     async def _judge(
         self,
         *,
@@ -301,21 +309,23 @@ class CaseRunner:
         execution_result: CaseExecutionResult,
         output_dir: str,
     ) -> JudgeResult:
-        """Return the backend judge result, configured judge result, or default score."""
+        """Require an actual evaluation result, never a completion-based score."""
         if execution_result.judge_result is not None:
-            return execution_result.judge_result
-        if self.judger is not None:
-            return await self.judger.judge(
+            result = execution_result.judge_result
+        elif self.judger is not None:
+            result = await self.judger.judge(
                 case=case,
                 execution_result=execution_result,
                 output_dir=output_dir,
             )
-        return JudgeResult(
-            method="none",
-            score=1.0 if execution_result.execution_status == "passed" else 0.0,
-            passed=execution_result.execution_status == "passed",
-            reason="no judger configured",
-        )
+        else:
+            raise EvaluationInfrastructureError(
+                "Cannot score this case: no judger configured and no backend JudgeResult. "
+                "Successful execution is not evidence of correctness."
+            )
+        if _is_execution_only_evaluation({"method": result.method, "metadata": result.metadata}):
+            raise EvaluationInfrastructureError("Completion-only JudgeResult is not a valid correctness evaluation")
+        return result
 
 
 def _case_id(case: dict[str, Any]) -> str:
@@ -323,13 +333,11 @@ def _case_id(case: dict[str, Any]) -> str:
 
 
 def _case_inputs(case: dict[str, Any]) -> Any:
-    for key in ("input", "inputs", "task_input", "query", "prompt"):
-        if key in case:
-            value = case[key]
-            if key == "input" and isinstance(value, dict) and set(value) == {"user_message"}:
-                return value["user_message"]
-            return value
-    return case
+    try:
+        return task_input(case)
+    except ValueError:
+        # Invalid inputs still need a diagnostic trace, never a reference dump.
+        return None
 
 
 def _case_result_status(

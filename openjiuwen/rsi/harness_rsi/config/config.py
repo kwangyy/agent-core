@@ -49,11 +49,17 @@ class ModelConfigs:
 
 @dataclass(frozen=True, slots=True)
 class EvaluatorConfig:
-    """Standalone Harness execution and deterministic scoring."""
+    """Standalone Harness execution and explicitly selected scoring."""
 
     model_config_ref: str = ""
     backend: str = "single_harness"
     evaluation_method: str = "script-based"
+    judge_model_config_ref: str = ""
+    judge_agent_max_iterations: int = 8
+    judge_agent_max_tokens: int = 8192
+    judge_timeout_sec: int = 300
+    judge_max_retries: int = 2
+    judge_success_score: float = 0.8
     transient_case_retry_limit: int = 2
     solver_backend: str = "deep_agent"
     jiuwenswarm_executable: str = ""
@@ -69,6 +75,12 @@ class EvaluatorConfig:
             model_config_ref=str(data.get("model_config_ref", "")),
             backend=str(data.get("backend", "single_harness")),
             evaluation_method=str(data.get("evaluation_method", "script-based")),
+            judge_model_config_ref=str(data.get("judge_model_config_ref", "")),
+            judge_agent_max_iterations=_int_value(data.get("judge_agent_max_iterations"), default=8),
+            judge_agent_max_tokens=_int_value(data.get("judge_agent_max_tokens"), default=8192),
+            judge_timeout_sec=_int_value(data.get("judge_timeout_sec"), default=300),
+            judge_max_retries=_int_value(data.get("judge_max_retries"), default=2),
+            judge_success_score=float(data.get("judge_success_score", 0.8)),
             transient_case_retry_limit=_int_value(
                 data.get("transient_case_retry_limit"),
                 default=2,
@@ -266,7 +278,7 @@ class AutoCoordinatingHarnessConfig:
     """Top-level standalone Harness optimization configuration."""
 
     workspace_dir: str = ""
-    max_epochs: int = 1
+    max_epochs: int = 5
     model_configs: ModelConfigs = field(default_factory=ModelConfigs)
     data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
@@ -287,7 +299,7 @@ class AutoCoordinatingHarnessConfig:
         )
         config = cls(
             workspace_dir=str(data.get("workspace_dir", "")),
-            max_epochs=_int_value(data.get("max_epochs"), default=1),
+            max_epochs=_int_value(data.get("max_epochs"), default=5),
             model_configs=model_configs,
             data_loader=DataLoaderConfig.from_dict(_mapping(data.get("data_loader"))),
             evaluator=replace(evaluator, model_config_ref=model_configs.evaluation),
