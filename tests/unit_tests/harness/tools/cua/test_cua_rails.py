@@ -22,6 +22,7 @@ from openjiuwen.harness.tools.cua.rails import (
     CuaScreenshotDownscaleRail,
     CuaSnapshotDedupRail,
     CuaSnapshotFreshnessRail,
+    CuaUserTakeoverRail,
 )
 
 
@@ -208,6 +209,155 @@ def _tool_ctx(tool_name: str, tool_args) -> SimpleNamespace:
         tool_args=tool_args,
     )
     return SimpleNamespace(inputs=inputs, extra={})
+
+
+# ── CuaUserTakeoverRail ──────────────────────────────────────────────────
+#
+# "Once the user takes over the screen, the agent should pause." The rail
+# must hold desktop actions while the OS reports recent user input, release
+# them once the desktop is idle again, and give up (with a report) rather
+# than wait forever. All timing is driven by a fake clock and probe.
+
+
+class _FakeDesktop:
+    """Scripted probe + clock: ``idle_values`` are returned per poll in order."""
+
+    def __init__(self, idle_values):
+        self.idle_values = list(idle_values)
+        self.now = 100.0
+        self.slept = 0.0
+
+    def seconds_since_last_input(self):
+        if len(self.idle_values) > 1:
+            return self.idle_values.pop(0)
+        return self.idle_values[0]
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.slept += seconds
+        self.now += seconds
+
+
+def _takeover_rail(desk: _FakeDesktop, **overrides) -> CuaUserTakeoverRail:
+    kwargs = dict(
+        probe=desk,
+        active_within_s=3.0,
+        resume_after_idle_s=5.0,
+        max_wait_s=10.0,
+        poll_interval_s=1.0,
+        sleep=desk.sleep,
+        monotonic=desk.monotonic,
+    )
+    kwargs.update(overrides)
+    return CuaUserTakeoverRail(_mcp_cfg(), **kwargs)
+
+
+def _finish_call(ctx, text: str = "\u2705 ok") -> None:
+    ctx.inputs.tool_result = {"content": text}
+    ctx.inputs.tool_msg = ToolMessage(content=text, tool_call_id="call-1")
+
+
+@pytest.mark.asyncio
+async def test_idle_desktop_never_delays_an_action() -> None:
+    desk = _FakeDesktop([42.0])
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+    _finish_call(ctx)
+    await rail.after_tool_call(ctx)
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+    assert "held" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_action_is_held_while_the_user_is_active_then_released() -> None:
+    # User active (idle 0.5s, 1.0s), then hands off: idle grows past 5s.
+    desk = _FakeDesktop([0.5, 1.0, 2.0, 6.0])
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"})
+
+    await rail.before_tool_call(ctx)
+
+    assert not ctx.extra.get("_skip_tool")
+    assert desk.slept == 3.0  # three polls before the desktop was idle >= 5s
+    _finish_call(ctx)
+    await rail.after_tool_call(ctx)
+    assert "held for 3s" in ctx.inputs.tool_msg.content
+    assert "re-snapshot" in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_a_takeover_that_outlasts_the_budget_ends_with_a_report() -> None:
+    desk = _FakeDesktop([0.2])  # user never stops
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.extra["_skip_tool"] is True
+    assert desk.slept == 10.0
+    assert "taken over the desktop" in ctx.inputs.tool_result["error"]
+    assert ctx.inputs.tool_msg.tool_call_id == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_the_agents_own_foreground_input_is_not_mistaken_for_the_user() -> None:
+    # Under foreground delivery the agent's click is a real OS input event.
+    # After a click 2.0s ago, the OS reports idle=2.0s: that is the agent.
+    desk = _FakeDesktop([2.0])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    _finish_call(click)
+    await rail.after_tool_call(click)  # records own input at now=100
+    desk.now = 102.0
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_user_input_after_the_agents_own_input_still_pauses() -> None:
+    # Agent clicked 2.0s ago but the OS saw input 0.3s ago: that is the user.
+    desk = _FakeDesktop([0.3, 0.3, 9.0])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    _finish_call(click)
+    await rail.after_tool_call(click)
+    desk.now = 102.0
+
+    ctx = _tool_ctx("mcp_cua-driver_scroll", {"pid": 1})
+    await rail.before_tool_call(ctx)
+
+    assert desk.slept == 2.0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_rail_is_inert_without_a_probe_and_for_non_cua_tools() -> None:
+    desk = _FakeDesktop([0.1])
+    no_probe = CuaUserTakeoverRail(_mcp_cfg(), probe=None, sleep=desk.sleep, monotonic=desk.monotonic)
+    no_probe._probe = None  # platform without a probe
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await no_probe.before_tool_call(ctx)
+    assert not ctx.extra.get("_skip_tool") and desk.slept == 0
+
+    rail = _takeover_rail(desk)
+    other = _tool_ctx("read_file", {"path": "x"})
+    await rail.before_tool_call(other)
+    assert desk.slept == 0 and not other.extra.get("_skip_tool")
+
+
+def test_takeover_thresholds_are_validated() -> None:
+    with pytest.raises(ValueError):
+        CuaUserTakeoverRail(_mcp_cfg(), probe=_FakeDesktop([1.0]), max_wait_s=0)
 
 
 @pytest.mark.asyncio

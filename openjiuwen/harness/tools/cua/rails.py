@@ -11,8 +11,9 @@ import hashlib
 import io
 import json
 import re
+import time
 import uuid
-from typing import Any, Literal, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, Tuple
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import raise_error
@@ -21,6 +22,7 @@ from openjiuwen.core.foundation.llm import ToolMessage
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.core.foundation.tool.mcp.base import mcp_model_tool_name, mcp_model_tool_prefix
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail, ToolCallInputs
+from openjiuwen.harness.tools.cua.user_activity import UserActivityProbe, build_default_user_activity_probe
 
 _DAEMON_REMEDIATION = (
     "cua-driver daemon unreachable. Start it with `cua-driver autostart kick` "
@@ -45,6 +47,23 @@ _DELIVERY_MODE_TOOL_NAMES: tuple[str, ...] = (
     "right_click",
     "scroll",
     "type_text",
+)
+
+# cua-driver tools that inject real input events. Under foreground delivery
+# these register with the OS exactly like a human's, so the takeover rail must
+# be able to tell its own recent input apart from the user's.
+_INPUT_TOOL_NAMES: tuple[str, ...] = _DELIVERY_MODE_TOOL_NAMES + ("set_value", "move_cursor")
+
+_USER_TAKEOVER_BLOCKED = (
+    "Paused for {waited:.0f}s because the user is actively using the desktop (mouse/keyboard "
+    "input detected) and has not stopped. Do not send further desktop actions. Report that the "
+    "user has taken over the desktop, summarize what was completed so far, and state that the "
+    "task can be resumed once they hand control back."
+)
+_USER_TAKEOVER_RESUMED_NOTE = (
+    "Note: this action was held for {waited:.0f}s because the user was using the desktop; it ran "
+    "once the desktop had been idle for {idle:.0f}s. The screen may have changed meanwhile -- "
+    "re-snapshot with get_window_state before element-addressed actions."
 )
 
 _BACKGROUND_ONLY_REJECTION = (
@@ -398,6 +417,131 @@ class CuaDeliveryModeRail(AgentRail):
     @staticmethod
     def _reject_tool(ctx: AgentCallbackContext, inputs: ToolCallInputs, error_msg: str) -> None:
         """Hard-block a tool call using the shared rail contract."""
+        tool_call = inputs.tool_call
+        tool_call_id = tool_call.id if tool_call else ""
+        ctx.extra["_skip_tool"] = True
+        inputs.tool_result = {"error": error_msg}
+        inputs.tool_msg = ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+
+
+class CuaUserTakeoverRail(AgentRail):
+    """Pause desktop actions while the user is using the machine.
+
+    "Once the user takes over the screen, the agent should pause." The driver
+    has no such signal, so the rail asks the OS (``UserActivityProbe``) how
+    long ago the last mouse/keyboard event happened, and holds every
+    cua-driver call while that is recent:
+
+    - the user counts as active when the desktop was touched within
+      ``active_within_s``;
+    - a held call proceeds once the desktop has been idle for
+      ``resume_after_idle_s`` (pause-and-wait, not stop), and the tool result
+      is annotated so the model re-snapshots before trusting old indices;
+    - after ``max_wait_s`` of continuous user activity the call is rejected
+      with an instruction to report the takeover, so a delegation never sits
+      silent forever.
+
+    Under foreground delivery the agent's own clicks and keystrokes are real
+    OS input too. An input event whose age matches the agent's last own input
+    action (within ``self_input_grace_s``) is attributed to the agent, not the
+    user. Without a probe (non-Windows hosts) the rail is inert.
+    """
+
+    def __init__(
+        self,
+        mcp_cfg: McpServerConfig,
+        *,
+        probe: Optional[UserActivityProbe] = None,
+        active_within_s: float = 3.0,
+        resume_after_idle_s: float = 5.0,
+        max_wait_s: float = 60.0,
+        poll_interval_s: float = 0.5,
+        self_input_grace_s: float = 1.5,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__()
+        if active_within_s <= 0 or resume_after_idle_s <= 0 or max_wait_s <= 0 or poll_interval_s <= 0:
+            raise ValueError("cua takeover thresholds must be positive seconds")
+        self._tool_prefix = mcp_model_tool_prefix(mcp_cfg.server_name)
+        self._input_tool_names = frozenset(
+            mcp_model_tool_name(mcp_cfg.server_name, tool_name) for tool_name in _INPUT_TOOL_NAMES
+        )
+        self._probe = probe if probe is not None else build_default_user_activity_probe()
+        self._active_within_s = float(active_within_s)
+        self._resume_after_idle_s = float(resume_after_idle_s)
+        self._max_wait_s = float(max_wait_s)
+        self._poll_interval_s = float(poll_interval_s)
+        self._self_input_grace_s = float(self_input_grace_s)
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last_own_input_at: Optional[float] = None
+        self._pending_note: Optional[str] = None
+
+    @property
+    def active(self) -> bool:
+        """Whether a probe is available, i.e. the rail can actually observe the user."""
+        return self._probe is not None
+
+    async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
+        inputs = ctx.inputs
+        if not isinstance(inputs, ToolCallInputs) or self._probe is None:
+            return
+        tool_name = str(inputs.tool_name or "")
+        if not tool_name.startswith(self._tool_prefix) or ctx.extra.get("_skip_tool"):
+            return
+
+        waited = 0.0
+        idle = self._user_idle_seconds()
+        if idle is None or idle >= self._active_within_s:
+            return
+        logger.warning(
+            "[CuaUserTakeoverRail] user is using the desktop (idle %.1fs); holding %s", idle, tool_name
+        )
+        while True:
+            if waited >= self._max_wait_s:
+                logger.warning(
+                    "[CuaUserTakeoverRail] user still active after %.0fs; rejecting %s", waited, tool_name
+                )
+                self._reject_tool(ctx, inputs, _USER_TAKEOVER_BLOCKED.format(waited=waited))
+                return
+            await self._sleep(self._poll_interval_s)
+            waited += self._poll_interval_s
+            idle = self._user_idle_seconds()
+            if idle is None or idle >= self._resume_after_idle_s:
+                break
+        logger.info("[CuaUserTakeoverRail] desktop idle again after %.1fs; releasing %s", waited, tool_name)
+        self._pending_note = _USER_TAKEOVER_RESUMED_NOTE.format(
+            waited=waited, idle=self._resume_after_idle_s
+        )
+
+    async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
+        inputs = ctx.inputs
+        if not isinstance(inputs, ToolCallInputs):
+            return
+        tool_name = str(inputs.tool_name or "")
+        if not tool_name.startswith(self._tool_prefix):
+            return
+        if tool_name in self._input_tool_names:
+            self._last_own_input_at = self._monotonic()
+        if self._pending_note is not None:
+            _append_advisory(inputs, self._pending_note)
+            self._pending_note = None
+
+    def _user_idle_seconds(self) -> Optional[float]:
+        idle = self._probe.seconds_since_last_input()
+        if idle is None:
+            return None
+        if self._last_own_input_at is not None:
+            since_own = self._monotonic() - self._last_own_input_at
+            # The last OS input event coincides with our own injected action:
+            # that is the agent, not the user. Anything more recent is the user.
+            if abs(idle - since_own) <= self._self_input_grace_s:
+                return float("inf")
+        return idle
+
+    @staticmethod
+    def _reject_tool(ctx: AgentCallbackContext, inputs: ToolCallInputs, error_msg: str) -> None:
         tool_call = inputs.tool_call
         tool_call_id = tool_call.id if tool_call else ""
         ctx.extra["_skip_tool"] = True
