@@ -290,6 +290,9 @@ def test_auto_full_baseline_is_frozen_inside_single_run(tmp_path: Path) -> None:
     assert baseline_progress.iteration == 0
     assert baseline_progress.total_iterations == 1
     assert len(report["epoch_checkpoints"]) == 1
+    for call in evaluator.calls:
+        full = Path(call["output_dir"]).name in {"frozen_baseline", "full"}
+        assert call["case_concurrency"] == (2 if full else 1)
 
     call_count = len(evaluator.calls)
     asyncio.run(
@@ -1147,11 +1150,19 @@ def test_verified_passes_are_protected_from_later_epoch_optimization(
             for case in kwargs["cases"]:
                 case_id = str(case["case_id"])
                 passed = case_id == "solved"
+                case_dir = output_dir / "cases" / case_id
+                case_dir.mkdir(parents=True)
+                result_path = case_dir / "result.json"
+                trace_path = case_dir / "trace.json"
+                result_path.write_text(json.dumps({"evaluation": {"method": "exact-match", "passed": passed}}))
+                trace_path.write_text("{}")
                 case_refs.append(
                     {
                         "case_id": case_id,
                         "status": "passed" if passed else "failed",
                         "score": 1.0 if passed else 0.0,
+                        "result_path": str(result_path),
+                        "trace_path": str(trace_path),
                     }
                 )
             eval_ref = output_dir / "eval_ref.yaml"
@@ -1192,6 +1203,10 @@ def test_verified_passes_are_protected_from_later_epoch_optimization(
     )
     harness_refs = tmp_path / "harness_refs.yaml"
     _write_yaml(harness_refs, {"harness_refs": {"solver": "baseline"}})
+    harness_dir = tmp_path / "baseline"
+    harness_dir.mkdir()
+    (harness_dir / "harness.yaml").write_text("name: baseline\n")
+    _write_yaml(harness_refs, {"harness_refs": {"solver": str(harness_dir)}})
     evaluator = MixedOutcomeEvaluator()
     orchestrator = SingleHarnessIterativeOptimizationOrchestrator(
         AutoCoordinatingHarnessConfig(
@@ -1221,8 +1236,9 @@ def test_verified_passes_are_protected_from_later_epoch_optimization(
     }
     assert source_calls == {
         "e001": ["solved", "unresolved"],
-        "e002": ["unresolved"],
     }
+    state = yaml.safe_load(Path(result.state_path).read_text(encoding="utf-8"))
+    assert state["completed_batches"]["epoch_002:batch_001"]["source_evidence"]["reused_case_ids"] == ["unresolved"]
     report = yaml.safe_load(Path(result.report_path).read_text(encoding="utf-8"))
     assert report["retained_case_ids"] == ["solved"]
 

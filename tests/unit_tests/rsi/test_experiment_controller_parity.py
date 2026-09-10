@@ -96,16 +96,21 @@ async def test_analyzer_agrees_with_controller_pass_decision(
     assert observed == expected
 
 
+@pytest.mark.parametrize("continue_locally,last_accepted", [(False, True), (True, True), (True, False)])
 def test_partial_verifier_progress_reenters_analysis_with_candidate_feedback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    continue_locally: bool,
+    last_accepted: bool,
 ) -> None:
     class FeedbackAnalyzer:
         def __init__(self) -> None:
             self.feedback: list[dict[str, Any]] = []
+            self.sources = []
 
         async def analyze(self, invocation: Any) -> str:
             self.feedback.append(dict(invocation.prior_candidate_feedback or {}))
+            self.sources.append((invocation.harness_refs_path, invocation.eval_ref_path))
             output_dir = Path(invocation.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             analysis_ref = output_dir / "analysis_ref.yaml"
@@ -136,9 +141,11 @@ def test_partial_verifier_progress_reenters_analysis_with_candidate_feedback(
     class SequentialOptimizer:
         def __init__(self) -> None:
             self.call_count = 0
+            self.sources = []
 
         async def optimize(self, **kwargs: Any) -> str:
             self.call_count += 1
+            self.sources.append(kwargs["harness_refs_path"])
             run_dir = Path(kwargs["output_dir"]) / f"run_{self.call_count}"
             run_dir.mkdir(parents=True)
             candidate_refs = run_dir / f"candidate_refs_{self.call_count}.yaml"
@@ -211,14 +218,24 @@ def test_partial_verifier_progress_reenters_analysis_with_candidate_feedback(
             "candidate_failure_diagnoses": {},
         }
         if gate_calls == 1:
+            candidate_eval = tmp_path / "partial_eval.yaml"
+            partial_result = tmp_path / "partial_result.json"
+            partial_result.write_text("{}", encoding="utf-8")
+            _write_yaml(candidate_eval, {
+                "harness_refs_path": kwargs["candidate_harness_refs_path"],
+                "cases": [{"case_id": "case_001", "status": "failed", "score": 0.0,
+                           "result_path": str(partial_result)}],
+            })
             return {
                 **base,
                 "accepted": False,
                 "status": "rejected",
                 "reason": "candidate_made_partial_verifier_progress",
                 "failure_class": "partial_contract_progress",
+                "candidate_eval_ref_path": str(candidate_eval),
                 "verifier_deltas_by_case": {
                     "case_001": {
+                        "partial_progress": continue_locally,
                         "newly_passed_fail_to_pass": ["branch_a"],
                         "remaining_failed_fail_to_pass": ["branch_b"],
                     }
@@ -232,9 +249,9 @@ def test_partial_verifier_progress_reenters_analysis_with_candidate_feedback(
             }
         return {
             **base,
-            "accepted": True,
-            "status": "accepted",
-            "reason": "candidate_improved_target_cases",
+            "accepted": last_accepted,
+            "status": "accepted" if last_accepted else "rejected",
+            "reason": "candidate_improved_target_cases" if last_accepted else "no_improvement",
             "failure_class": "",
             "verifier_deltas_by_case": {},
         }
@@ -259,8 +276,17 @@ def test_partial_verifier_progress_reenters_analysis_with_candidate_feedback(
     feedback = analyzer.feedback[1]["by_case"]["case_001"][0]
     assert feedback["outcome"] == "partial_contract_progress"
     assert feedback["verifier_delta"]["remaining_failed_fail_to_pass"] == ["branch_b"]
-    assert completed["candidate_attempts"][1]["accepted_target_case_ids"] == ["case_001"]
-    assert state["candidate_gates"][1]["primary_gate_accepted"] is True
+    assert completed["candidate_attempts"][1]["accepted_target_case_ids"] == (["case_001"] if last_accepted else [])
+    assert state["candidate_gates"][0]["accepted"] is False
+    if continue_locally:
+        assert optimizer.sources[1].endswith("candidate_refs_1.yaml")
+        assert analyzer.sources[1] == (optimizer.sources[1], str(tmp_path / "partial_eval.yaml"))
+        assert len(state["candidate_gates"][1]["capabilities"]) == 2
+    else:
+        assert optimizer.sources[1] == str(harness_refs.resolve())
+    if not last_accepted:
+        assert state["current_harness_refs_path"] == str(harness_refs.resolve())
+    assert state["candidate_gates"][1]["primary_gate_accepted"] is last_accepted
 
 
 @pytest.mark.parametrize("action_group", ["skill", "tool"])
