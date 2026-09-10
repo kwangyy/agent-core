@@ -7,10 +7,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Collection, List, Optional
+
+import anyio
 
 if TYPE_CHECKING:
     from openjiuwen.harness.deep_agent import DeepAgent
@@ -50,6 +53,31 @@ except Exception:  # pragma: no cover - browser runtime is optional here
 # Keep one delegation above the browser runtime's 540-second complex-task
 # slice so startup, state reconciliation, and final result assembly can finish.
 DEFAULT_SUBAGENT_TASK_TIMEOUT_S = 720.0
+# Operators raise the budget for long desktop/browser work without a code
+# change; a value that does not parse as a positive number keeps the default.
+SUBAGENT_TASK_TIMEOUT_ENV = "OPENJIUWEN_SUBAGENT_TASK_TIMEOUT_S"
+# cua_agent stops itself this far before the tool-call ceiling so the model
+# receives a resumable result instead of a bare "timed out" error that loses
+# every step the desktop agent already took.
+_CUA_TIMEOUT_MARGIN_S = 20.0
+
+
+def resolve_subagent_task_timeout_s() -> float:
+    """Delegation ceiling in seconds: env override when valid, else the default."""
+    raw = (os.getenv(SUBAGENT_TASK_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_SUBAGENT_TASK_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        logger.warning(
+            "[TaskTool] ignoring %s=%r (need a positive number of seconds); using %ss",
+            SUBAGENT_TASK_TIMEOUT_ENV, raw, DEFAULT_SUBAGENT_TASK_TIMEOUT_S,
+        )
+        return DEFAULT_SUBAGENT_TASK_TIMEOUT_S
+    return value
 _BROWSER_QUERY_STATE_KEY = "__browser_query_delegation_state__"
 _BROWSER_SIMPLE_QUERY_BUDGET_S = 240.0
 _BROWSER_COMPLEX_QUERY_BUDGET_S = 600.0
@@ -796,6 +824,49 @@ class TaskTool(Tool):
             reason,
         )
 
+    def _cua_delegation_budget_s(self) -> float:
+        """Seconds a cua delegation may run before it is returned as resumable.
+
+        Derived from the tool card's ``resilience.timeout_s`` (the ceiling the
+        AbilityManager enforces) minus a margin, so this path always wins the
+        race against the hard timeout. Cards without the property (tests,
+        hand-built tools) fall back to the configured default ceiling.
+        """
+        properties = getattr(self.card, "properties", None)
+        resilience = properties.get("resilience") if isinstance(properties, dict) else None
+        ceiling = resilience.get("timeout_s") if isinstance(resilience, dict) else None
+        if not isinstance(ceiling, (int, float)) or isinstance(ceiling, bool) or ceiling <= 0:
+            ceiling = resolve_subagent_task_timeout_s()
+        return max(float(ceiling) - _CUA_TIMEOUT_MARGIN_S, float(ceiling) * 0.5)
+
+    @staticmethod
+    def _build_cua_timeout_output(
+        subagent: Any,
+        *,
+        sub_session_id: str,
+        budget_s: float,
+    ) -> ToolOutput:
+        message = (
+            f"cua_agent ran out of its {budget_s:.0f}s delegation budget before reporting. "
+            "Its desktop session and progress are preserved. To continue, call task_tool "
+            "again with subagent_type='cua_agent', the same resume_task_id, and a "
+            "task_description covering only what is still missing."
+        )
+        data = {
+            "output": message,
+            "agent_id": getattr(getattr(subagent, "card", None), "id", None),
+            "resume_task_id": sub_session_id,
+            "status": "timeout",
+            "retryable": True,
+            "resume_context": {
+                "status": "timeout",
+                "recommended_recovery": (
+                    "Resume with the same resume_task_id; do not restart from scratch."
+                ),
+            },
+        }
+        return ToolOutput(success=True, data=data, error=None)
+
     async def _invoke_created_subagent(
         self,
         subagent: Any,
@@ -871,14 +942,43 @@ class TaskTool(Tool):
                         child_session,
                         subagent_type=normalized_type,
                     )
-                result = await self._invoke_with_usage_delegation(
-                    subagent,
-                    subagent_inputs,
-                    parent_session_id=parent_session_id,
-                    sub_session_id=sub_session_id,
-                    parent_invocation_id=parent_invocation_id,
-                    session=child_session,
-                )
+                if normalized_type == "cua_agent":
+                    # Stop before the tool-call ceiling fires: a desktop run
+                    # that ran out of time still has its session (and every
+                    # snapshot/action so far) checkpointed under
+                    # sub_session_id, so hand the model a resumable result
+                    # instead of letting AbilityManager raise a bare timeout.
+                    budget_s = self._cua_delegation_budget_s()
+                    try:
+                        with anyio.fail_after(budget_s):
+                            result = await self._invoke_with_usage_delegation(
+                                subagent,
+                                subagent_inputs,
+                                parent_session_id=parent_session_id,
+                                sub_session_id=sub_session_id,
+                                parent_invocation_id=parent_invocation_id,
+                                session=child_session,
+                            )
+                    except TimeoutError:
+                        logger.warning(
+                            "[TaskTool] cua_agent delegation exceeded %.0fs; returning resumable "
+                            "result for sub_session=%s",
+                            budget_s, sub_session_id,
+                        )
+                        return self._build_cua_timeout_output(
+                            subagent,
+                            sub_session_id=sub_session_id,
+                            budget_s=budget_s,
+                        )
+                else:
+                    result = await self._invoke_with_usage_delegation(
+                        subagent,
+                        subagent_inputs,
+                        parent_session_id=parent_session_id,
+                        sub_session_id=sub_session_id,
+                        parent_invocation_id=parent_invocation_id,
+                        session=child_session,
+                    )
                 succeeded = True
                 return self._build_task_output(
                     result,
@@ -1056,7 +1156,7 @@ def create_task_tool(
     )
     card.properties = {
         **(card.properties if isinstance(card.properties, dict) else {}),
-        "resilience": {"timeout_s": DEFAULT_SUBAGENT_TASK_TIMEOUT_S},
+        "resilience": {"timeout_s": resolve_subagent_task_timeout_s()},
     }
 
     return [
@@ -1071,6 +1171,8 @@ def create_task_tool(
 
 __all__ = [
     "DEFAULT_SUBAGENT_TASK_TIMEOUT_S",
+    "SUBAGENT_TASK_TIMEOUT_ENV",
+    "resolve_subagent_task_timeout_s",
     "TaskTool",
     "create_task_tool",
 ]

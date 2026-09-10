@@ -23,6 +23,8 @@ from openjiuwen.harness.schema.config import DeepAgentConfig, SubAgentConfig
 from openjiuwen.harness.tools import TaskTool, create_task_tool
 from openjiuwen.harness.tools.subagent.task_tool import (
     DEFAULT_SUBAGENT_TASK_TIMEOUT_S,
+    SUBAGENT_TASK_TIMEOUT_ENV,
+    resolve_subagent_task_timeout_s,
 )
 
 
@@ -286,6 +288,83 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
                 session=Session(session_id="parent_session"),
             )
         self.assertEqual(cleanup_calls, 1)
+
+    async def test_cua_delegation_timeout_returns_a_resumable_result(self) -> None:
+        """A cua run that outlives its budget must not lose its session.
+
+        The desktop agent checkpoints every snapshot/action under the sub
+        session; a bare timeout error made the coordinator restart from
+        scratch (live: 12 minutes of Discord navigation discarded). The tool
+        must instead hand back resume_task_id with status=timeout.
+        """
+        cleanup_calls = 0
+
+        class FakeSubAgent:
+            card = AgentCard(name="cua_agent", description="cua", id="cua_id")
+
+            async def invoke(self, _inputs):
+                await asyncio.sleep(60)
+
+            async def cleanup_task_resources(self) -> None:
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+
+        parent_agent = SimpleNamespace(
+            create_subagent=lambda *_args, **_kwargs: FakeSubAgent(),
+        )
+        card = ToolCard(id="task_tool_test", name="task_tool", description="test")
+        # Ceiling of 0.4s -> budget max(0.4-20, 0.2) = 0.2s: the inner timeout
+        # must fire well before a 60s subagent finishes.
+        card.properties = {"resilience": {"timeout_s": 0.4}}
+        tool = TaskTool(card=card, parent_agent=parent_agent)
+
+        result = await asyncio.wait_for(
+            tool.invoke(
+                {"subagent_type": "cua_agent", "task_description": "open the settings window"},
+                session=Session(session_id="parent_session"),
+            ),
+            timeout=5,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["status"], "timeout")
+        self.assertTrue(result.data["retryable"])
+        self.assertRegex(result.data["resume_task_id"], r"^parent_session_sub_cua_agent_[0-9a-f]{8}$")
+        self.assertIn("resume_task_id", result.data["output"])
+        self.assertEqual(cleanup_calls, 1)
+
+    async def test_non_cua_delegations_keep_raising_on_the_hard_timeout(self) -> None:
+        class FakeSubAgent:
+            card = AgentCard(name="test_agent", description="test", id="test_id")
+
+            async def invoke(self, _inputs):
+                await asyncio.sleep(60)
+
+            async def cleanup_task_resources(self) -> None:
+                return None
+
+        parent_agent = SimpleNamespace(
+            create_subagent=lambda *_args, **_kwargs: FakeSubAgent(),
+        )
+        card = ToolCard(id="task_tool_test", name="task_tool", description="test")
+        card.properties = {"resilience": {"timeout_s": 0.4}}
+        tool = TaskTool(card=card, parent_agent=parent_agent)
+
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(
+                tool.invoke(
+                    {"subagent_type": "code", "task_description": "run task"},
+                    session=Session(session_id="parent_session"),
+                ),
+                timeout=0.5,
+            )
+
+    def test_subagent_task_timeout_env_override(self) -> None:
+        with patch.dict("os.environ", {SUBAGENT_TASK_TIMEOUT_ENV: "1800"}):
+            self.assertEqual(resolve_subagent_task_timeout_s(), 1800.0)
+        for bad in ("", "abc", "0", "-5"):
+            with patch.dict("os.environ", {SUBAGENT_TASK_TIMEOUT_ENV: bad}):
+                self.assertEqual(resolve_subagent_task_timeout_s(), DEFAULT_SUBAGENT_TASK_TIMEOUT_S)
 
     async def test_task_tool_cleans_up_when_outer_timeout_cancels_invoke(self) -> None:
         cleanup_calls = 0
