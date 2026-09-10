@@ -14,7 +14,19 @@ from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.tree_provider.schemas i
     RsiTreeNode,
     RsiUsage,
     TreeResponse,
+    friendly_failure_reason,
 )
+
+
+def _display_node(node: RsiTreeNode) -> RsiTreeNode:
+    """Provider-facing copy of `node` for TreeResponse -- see
+    orchestrator.py's identically-named helper for the EventNode side of the
+    same transform; kept as two small copies rather than a shared import to
+    avoid projection.py depending on orchestrator.py for one function."""
+    friendly = friendly_failure_reason(node)
+    if friendly is None or friendly == node.reason:
+        return node
+    return node.model_copy(update={"reason": friendly})
 
 
 def tree_depth(nodes: list[RsiTreeNode]) -> int:
@@ -33,7 +45,11 @@ def tree_depth(nodes: list[RsiTreeNode]) -> int:
 
 
 def project_tree_response(task: PaperTaskState, nodes: list[RsiTreeNode]) -> TreeResponse:
-    return TreeResponse(nodes=nodes, depth=tree_depth(nodes), iteration=task.node_count)
+    return TreeResponse(
+        nodes=[_display_node(node) for node in nodes],
+        depth=tree_depth(nodes),
+        iteration=task.node_count,
+    )
 
 
 def project_engine_state(task: PaperTaskState, usage: RsiUsage | None = None) -> EngineState:
@@ -43,9 +59,9 @@ def project_engine_state(task: PaperTaskState, usage: RsiUsage | None = None) ->
         iteration=task.node_count,
         total_iterations=task.max_iterations,
         best_node_id=task.best_node_id,
-        score=None,
-        baseline=None,
-        usage=usage,
+        score=task.score,
+        baseline=task.baseline,
+        usage=usage if usage is not None else task.usage,
         updated_at=task.updated_at,
         error_code=task.error_code,
         error_message=task.error_message,
@@ -62,7 +78,9 @@ def project_engine_report(
         task_id=task.task_id,
         status=task.status,
         best_node_id=task.best_node_id,
-        usage=usage,
+        usage=usage if usage is not None else task.usage,
         artifact_index=artifact_index,
         summary=summary,
+        best_score=task.score,
+        baseline=task.baseline,
     )

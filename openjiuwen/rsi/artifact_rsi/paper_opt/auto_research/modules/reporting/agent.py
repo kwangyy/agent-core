@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common.workspace import
     paper_output_path,
     paper_refs_bib_path,
     paper_sections_dir,
+    paper_tex_path,
     paper_workspace_dir,
     project_root,
     resolve_project_reference,
@@ -48,6 +50,12 @@ from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.reporting.bibli
 from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.reporting.latex import (
     escape_latex,
     render_results_table,
+)
+from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.reporting.latex_runtime import (
+    LatexRuntime,
+    LatexRuntimeError,
+    discover_latex_runtime,
+    preflight_latex_runtime,
 )
 from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.reporting.schemas import (
     ReportingInput,
@@ -69,11 +77,53 @@ _REVIEWER_SYSTEM_PROMPT_PATH = Path(__file__).parent / "prompts" / "reviewer_sys
 _SECTIONS_BY_ID = {spec.id: spec for spec in SECTIONS}
 _CURRENT_EXPERIMENT_HEADING = "## Current Experiment"
 _RESEARCH_GROUNDING_HEADING = "## Research Grounding"
+_SURVEY_SOURCE_EXCERPT_CHARS = 6_000
+_SURVEY_EVIDENCE_TOTAL_CHARS = 30_000
+_MAX_HTML_SOURCE_CHARS = 256_000
+_HTML_READ_CHUNK_CHARS = 16_384
 # Lives at the workspace root (not under sections/) — host-written on a
 # failed attempt, read back (and overwritten) on the next retry. Named
 # loudly/uppercase so it stands out among sections/*.tex in a directory
 # listing, same reasoning as skills' own {PAPER_WORKSPACE} convention.
 _PREVIOUS_ATTEMPT_NOTES_FILENAME = "PREVIOUS_ATTEMPT_NOTES.md"
+_LATEX_RUNTIME_CONFIG_FILENAME = ".latex-runtime.json"
+
+
+class _HtmlTextExcerptParser(HTMLParser):
+    """Collect bounded visible HTML text without retaining the whole document."""
+
+    _IGNORED_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self._limit = max(0, limit)
+        self._length = 0
+        self._ignored_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._IGNORED_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth or self._length >= self._limit:
+            return
+        remaining = self._limit - self._length
+        chunk = data[:remaining]
+        self._parts.append(chunk)
+        self._length += len(chunk)
+
+    def text(self) -> str:
+        return " ".join(" ".join(self._parts).split())
+
+    @property
+    def at_limit(self) -> bool:
+        return self._length >= self._limit
 
 
 def _format_metric(value: Any) -> str:
@@ -92,6 +142,7 @@ class ReportingAgent:
         self.config = config
         self._injected_model = model
         self._pw_config = dict(config.get("reporting") or {})
+        self._latex_runtime: LatexRuntime | None = None
 
     def run(self, inputs: ReportingInput) -> ReportingOutput:
         import asyncio
@@ -104,6 +155,21 @@ class ReportingAgent:
     async def _run_async(self, inputs: ReportingInput) -> ReportingOutput:
         run_id = inputs.plan.run_id
         workspace = paper_workspace_dir(run_id)
+        latex_preflight_note: str | None = None
+        if self._pw_config.get("latex_preflight", True):
+            latex_bin_dir = os.environ.get("LATEX_BIN_DIR") or self._pw_config.get("latex_bin_dir")
+            try:
+                self._latex_runtime = preflight_latex_runtime(
+                    latex_bin_dir,
+                    timeout_seconds=float(self._pw_config.get("latex_preflight_timeout", 10.0)),
+                )
+            except LatexRuntimeError as exc:
+                self._latex_runtime = discover_latex_runtime(latex_bin_dir)
+                latex_preflight_note = (
+                    "LaTeX runtime preflight was unavailable; reporting will continue and "
+                    f"preserve source artifacts: {exc}"
+                )
+                _LOGGER.warning(latex_preflight_note)
         # First attempt for this run: wipe fresh, same "one-shot task" stance
         # topic_survey takes for the same reason (docs/paper_writing_design.md
         # §9). A retry (attempt > 1) keeps the workspace instead — the
@@ -153,18 +219,20 @@ class ReportingAgent:
         # a Python closure. Never evidence for the agent to write prose
         # from; the system prompt says so explicitly.
         (workspace / "results.json").write_text(inputs.result.model_dump_json(), encoding="utf-8")
-        (workspace / "known_citation_keys.json").write_text(
-            json.dumps(sorted(bib.known_keys)), encoding="utf-8"
-        )
+        (workspace / "known_citation_keys.json").write_text(json.dumps(sorted(bib.known_keys)), encoding="utf-8")
 
         evidence = self._build_evidence_blocks(inputs, design_context, background, bib, figure_path)
         # Host-authored (previous_attempt_notes, from the deterministic
         # verification pass) comes first — it's the ground truth. The
         # manager's own repair_instruction is layered after as optional
         # strategic commentary, not a replacement for it.
-        repair_text = "\n\n".join(
-            part for part in (previous_attempt_notes, inputs.repair_instruction) if part
-        )
+        repair_parts = [part for part in (previous_attempt_notes, inputs.repair_instruction) if part]
+        if latex_preflight_note:
+            repair_parts.append(
+                f"Host environment note: {latex_preflight_note} Do not repeatedly retry "
+                "an unavailable compiler; complete and preserve the paper source artifacts."
+            )
+        repair_text = "\n\n".join(repair_parts)
         query = self._build_task_query(evidence, repair_text)
 
         session_error = await self._run_paper_agent(run_id=run_id, query=query)
@@ -178,6 +246,7 @@ class ReportingAgent:
             known_keys=bib.known_keys,
             result=inputs.result,
             session_error=session_error,
+            preflight_note=latex_preflight_note,
         )
         # Persist for the next retry to read back above — overwritten every
         # attempt (this attempt's outcome, not an accumulating history) so a
@@ -217,12 +286,8 @@ class ReportingAgent:
         doc = parse_design_document(abs_path.read_text(encoding="utf-8"))
         body = doc.body
         context = dict(empty)
-        context["objective"] = current_claim_text(body, "objective") or latest_claim_text(
-            body, "objective"
-        )
-        context["hypothesis"] = current_claim_text(body, "hypothesis") or latest_claim_text(
-            body, "hypothesis"
-        )
+        context["objective"] = current_claim_text(body, "objective") or latest_claim_text(body, "objective")
+        context["hypothesis"] = current_claim_text(body, "hypothesis") or latest_claim_text(body, "hypothesis")
         for key, heading in (
             ("grounding", _RESEARCH_GROUNDING_HEADING),
             ("experiment", _CURRENT_EXPERIMENT_HEADING),
@@ -235,18 +300,74 @@ class ReportingAgent:
 
     @staticmethod
     def _read_survey_summary(survey: ResearchBrief) -> str | None:
-        """The first entry in survey.resource_paths is topic_survey's own
-        curated research_summary.md (topic_survey/agent.py::asurvey) — read
-        that one bounded file rather than granting a file-reading tool.
-        resource_paths is min_length=1 on ResearchBrief, so it's never empty
-        here."""
+        """Read the curated summary plus bounded local source evidence.
+
+        ``research_summary.md`` remains the first and authoritative handoff,
+        but metadata-only and directly downloaded HTML sources contain useful
+        context that should not be discarded before reporting.  The host reads
+        those files here instead of giving the paper agent an unrestricted file
+        tool.  Raw PDFs remain represented by the survey summary unless a
+        downstream extractor has already produced text.
+        """
         try:
             abs_path = resolve_project_reference(survey.resource_paths[0])
         except ValueError:
             return None
         if not abs_path.is_file():
             return None
-        return abs_path.read_text(encoding="utf-8")
+        try:
+            summary = abs_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        chunks = [summary]
+        total_chars = len(summary)
+        seen: set[Path] = {abs_path.resolve()}
+        for reference in survey.resource_paths[1:]:
+            if total_chars >= _SURVEY_EVIDENCE_TOTAL_CHARS:
+                break
+            try:
+                source_path = resolve_project_reference(reference).resolve()
+            except ValueError:
+                continue
+            if source_path in seen or not source_path.is_file():
+                continue
+            seen.add(source_path)
+            if source_path.suffix.lower() == ".pdf":
+                excerpt = "(PDF source is available locally; text extraction is deferred.)"
+            elif source_path.suffix.lower() in {".html", ".htm"}:
+                try:
+                    excerpt = ReportingAgent._read_html_excerpt(source_path, limit=_SURVEY_SOURCE_EXCERPT_CHARS)
+                except OSError as exc:
+                    excerpt = f"(source could not be read locally: {exc})"
+            else:
+                try:
+                    with source_path.open("r", encoding="utf-8", errors="replace") as source_file:
+                        excerpt = source_file.read(_SURVEY_SOURCE_EXCERPT_CHARS)
+                    excerpt = " ".join(excerpt.split())
+                except OSError as exc:
+                    excerpt = f"(source could not be read locally: {exc})"
+            remaining = _SURVEY_EVIDENCE_TOTAL_CHARS - total_chars
+            excerpt = excerpt[: min(_SURVEY_SOURCE_EXCERPT_CHARS, remaining)]
+            if not excerpt:
+                continue
+            chunks.append(f"\n\n## Detailed source evidence: {source_path.name}\n\n{excerpt}")
+            total_chars += len(excerpt)
+        return "".join(chunks)
+
+    @staticmethod
+    def _read_html_excerpt(path: Path, *, limit: int) -> str:
+        parser = _HtmlTextExcerptParser(limit)
+        remaining = _MAX_HTML_SOURCE_CHARS
+        with path.open("r", encoding="utf-8", errors="replace") as source_file:
+            while remaining > 0 and not parser.at_limit:
+                chunk = source_file.read(min(_HTML_READ_CHUNK_CHARS, remaining))
+                if not chunk:
+                    break
+                parser.feed(chunk)
+                remaining -= len(chunk)
+        parser.close()
+        return parser.text()
 
     @staticmethod
     def _resolve_summary_path(survey: ResearchBrief) -> Path | None:
@@ -269,8 +390,9 @@ class ReportingAgent:
         result = inputs.result
         citation_list = (
             "\n".join(f"- {title} -> \\cite{{{key}}}" for title, key in bib.title_to_key.items())
-            or "(no sources recovered)"
+            or "(no citable sources recovered)"
         )
+        evidence_only_list = "\n".join(f"- {item}" for item in bib.evidence_only_sources) or "(none)"
 
         metric_name_set: set[str] = set()
         for variant in result.variants:
@@ -323,11 +445,7 @@ class ReportingAgent:
             + "\n".join(variant_lines)
             + "\n\nHost-rendered results table — include exactly as given, do not redraw it:\n\n"
             + (table_tex or "(no numeric metrics to tabulate)")
-            + (
-                "\n\nHost-rendered figure — include exactly as given:\n\n" + figure_tex
-                if figure_tex
-                else ""
-            )
+            + ("\n\nHost-rendered figure — include exactly as given:\n\n" + figure_tex if figure_tex else "")
         )
 
         # Every section that's allowed to cite needs the exact valid keys —
@@ -338,6 +456,7 @@ class ReportingAgent:
         # \cite{GAIA_benchmark} vs the real generated key gaiaabenchmarkfo1c294c3f).
         citation_suffix = (
             f"\n\nCitable sources — use \\cite{{key}} only for these, never invent a key:\n{citation_list}"
+            f"\n\nEvidence-only sources — use as background evidence, but do not cite them:\n{evidence_only_list}"
         )
 
         return {
@@ -364,11 +483,7 @@ class ReportingAgent:
                 f"section, compiling, and staying within word/citation/"
                 f"traceable-number requirements over polish. "
             ) + preamble
-        return (
-            preamble
-            + "\n\n"
-            + "\n\n".join(f"## Evidence: {key}\n\n{value}" for key, value in evidence.items())
-        )
+        return preamble + "\n\n" + "\n\n".join(f"## Evidence: {key}\n\n{value}" for key, value in evidence.items())
 
     def _enabled_skill_dirs(self, skills_root: Path | None = None) -> list[str]:
         """Explicit per-skill directory list rather than the whole
@@ -387,11 +502,7 @@ class ReportingAgent:
         """
         root = _SKILLS_DIR if skills_root is None else Path(skills_root)
         method_figure_enabled = bool((self._pw_config.get("method_figure") or {}).get("enabled", True))
-        return [
-            str(root / name)
-            for name in _ALL_SKILL_NAMES
-            if name != "ts-figure" or method_figure_enabled
-        ]
+        return [str(root / name) for name in _ALL_SKILL_NAMES if name != "ts-figure" or method_figure_enabled]
 
     @staticmethod
     def _materialize_skills(workspace: Path, skill_dirs: list[str]) -> Path:
@@ -412,6 +523,20 @@ class ReportingAgent:
             src_path = Path(src)
             shutil.copytree(src_path, dest / src_path.name, ignore=ignore)
         return dest
+
+    def _write_latex_runtime_config(self, workspace: Path) -> None:
+        """Expose the resolved compiler directory to sandboxed skill scripts."""
+
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_path = workspace / _LATEX_RUNTIME_CONFIG_FILENAME
+        bin_dir = self._latex_runtime.bin_dir if self._latex_runtime is not None else None
+        if bin_dir is None:
+            config_path.unlink(missing_ok=True)
+            return
+        config_path.write_text(
+            json.dumps({"latex_bin_dir": str(bin_dir)}),
+            encoding="utf-8",
+        )
 
     # -- agent construction: mirrors code_implementation's _build_coding_agent
     # (create_deep_agent + guarded shell + fs tools scoped to a workspace) --
@@ -452,18 +577,11 @@ class ReportingAgent:
             timeout=completion_timeout,
         )
 
-        # ts-latex/scripts/compile.py reads LATEX_BIN_DIR to put a TeX
-        # distribution's bin/ on PATH for the subprocess it launches (SDK
-        # shell subprocesses inherit the full parent env — see
-        # OperationUtils.prepare_environment). Set here, not hardcoded in
-        # the script: a live run once found latexmk/pdflatex missing from
-        # PATH and edited a machine-specific absolute path into the skill
-        # script. Skills are now copied into the paper workspace (so that
-        # write cannot touch tracked source), but LATEX_BIN_DIR still
-        # exists so the agent has no reason to "helpfully" hardcode a path.
-        latex_bin_dir = os.environ.get("LATEX_BIN_DIR") or self._pw_config.get("latex_bin_dir")
-        if latex_bin_dir:
-            os.environ.setdefault("LATEX_BIN_DIR", latex_bin_dir)
+        # ts-latex/scripts/compile.py reads the workspace runtime config written below.
+        # This also covers direct construction with latex_preflight disabled.
+        if self._latex_runtime is None:
+            latex_bin_dir = os.environ.get("LATEX_BIN_DIR") or self._pw_config.get("latex_bin_dir")
+            self._latex_runtime = discover_latex_runtime(latex_bin_dir)
 
         # Same bridging pattern as LATEX_BIN_DIR above, for ts-figure's
         # attempt_drawio.py: DRAWIO_BIN (the export binary) and
@@ -480,6 +598,7 @@ class ReportingAgent:
             os.environ.setdefault("DRAWIO_SKILL_DIR", drawio_skill_dir)
 
         workspace = paper_workspace_dir(run_id)
+        self._write_latex_runtime_config(workspace)
         # Package-tree _SKILLS_DIR is outside the sandbox once
         # project_root() has been redirected to a task run_dir
         # (jiuwenswarm). Copy enabled skills into the paper workspace
@@ -588,9 +707,7 @@ class ReportingAgent:
         session = Session(session_id=request_id, card=getattr(agent, "card", None))
         try:
             await session.pre_run(inputs={"query": query, "conversation_id": request_id})
-            result = await Runner.run_agent(
-                agent, {"query": query, "conversation_id": request_id}, session=session
-            )
+            result = await Runner.run_agent(agent, {"query": query, "conversation_id": request_id}, session=session)
         except Exception as exc:  # noqa: BLE001 — surfaced as a note, not swallowed
             return f"reporting agent session raised {type(exc).__name__}: {exc}"
         finally:
@@ -628,9 +745,7 @@ class ReportingAgent:
                 spec = None
             if spec is not None:
                 headings = lint.extract_subsection_headings(method_text)
-                bad_labels = lint.check_method_figure_headings(
-                    [node.label for node in spec.nodes], headings
-                )
+                bad_labels = lint.check_method_figure_headings([node.label for node in spec.nodes], headings)
                 if bad_labels:
                     notes.append(
                         "method figure node label(s) not among method.tex's real "
@@ -695,6 +810,7 @@ class ReportingAgent:
         known_keys: set[str],
         result: Any,
         session_error: str | None = None,
+        preflight_note: str | None = None,
     ) -> ReportingOutput:
         drafts: dict[str, str] = {}
         for section_id in DOCUMENT_ORDER:
@@ -705,6 +821,8 @@ class ReportingAgent:
         notes: list[str] = []
         if session_error:
             notes.append(session_error)
+        if preflight_note:
+            notes.append(preflight_note)
         missing = [section_id for section_id in DOCUMENT_ORDER if section_id not in drafts]
         if missing:
             notes.append(f"section(s) never written: {', '.join(missing)}")
@@ -733,10 +851,30 @@ class ReportingAgent:
         figure_paths = [*figure_paths, *extra_figure_paths]
 
         final_pdf = paper_output_path(run_id)
+        final_tex = paper_tex_path(run_id)
+        # A missing PDF is only acceptable when the *environment* can't
+        # produce one at all (no latexmk/pdflatex on PATH or LATEX_BIN_DIR)
+        # and ts-latex still got far enough to assemble a real main.tex --
+        # a genuine unresolved compile error with the toolchain present must
+        # keep failing, since a retry can plausibly fix that but can never
+        # fix a missing binary. Reuse the runtime _run_async already
+        # resolved (via preflight_latex_runtime/discover_latex_runtime)
+        # instead of probing PATH a second time; same None-guard as
+        # _build_paper_agent's own fallback, for latex_preflight=False.
+        if self._latex_runtime is None:
+            latex_bin_dir = self._pw_config.get("latex_bin_dir") or os.environ.get("LATEX_BIN_DIR")
+            self._latex_runtime = discover_latex_runtime(latex_bin_dir)
+        toolchain_missing = not self._latex_runtime.available
+        tex_only = not final_pdf.is_file() and toolchain_missing and final_tex.is_file()
         if not final_pdf.is_file():
-            notes.append("no compiled PDF found at end of session — ts-latex did not report success")
+            notes.append(
+                "no LaTeX toolchain found in this environment (latexmk/pdflatex not on PATH) "
+                "— shipping main.tex as the final artifact instead of a compiled PDF"
+                if tex_only
+                else "no compiled PDF found at end of session — ts-latex did not report success"
+            )
 
-        if hallucinated or not final_pdf.is_file():
+        if hallucinated or (not final_pdf.is_file() and not tex_only):
             return ReportingOutput(
                 status="failed",
                 paper_pdf_path=None,
@@ -746,9 +884,10 @@ class ReportingAgent:
                 notes="; ".join(notes),
             )
 
+        artifact_path = final_pdf if final_pdf.is_file() else final_tex
         return ReportingOutput(
             status="compiled",
-            paper_pdf_path=str(final_pdf),
+            paper_pdf_path=str(artifact_path),
             sections_dir=str(sections_dir),
             refs_bib_path=str(refs_bib_path),
             figure_paths=figure_paths,
@@ -779,6 +918,7 @@ class ReportingAgent:
             raise RuntimeError(
                 f"reporting needs a model {config_key} — set "
                 f"the {env_key} environment variable"
-                + ("" if secret else f" or configs['openjiuwen']['{config_key}']") + "."
+                + ("" if secret else f" or configs['openjiuwen']['{config_key}']")
+                + "."
             )
         return value

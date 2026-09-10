@@ -23,7 +23,11 @@ RsiStatus = Literal[
 ]
 
 NodeOutcome = Literal["success", "failed", "rejected", "pending"]
-NodeLogicalKind = Literal["root", "reporting", "adopted", "rejected"]
+# ``failed`` remains the machine-level outcome for a node that could not
+# produce a usable candidate.  ``pruned`` is the user-facing tree kind for
+# that outcome, so a failed node can be skipped without being confused with a
+# normally evaluated-but-not-adopted candidate (``rejected``).
+NodeLogicalKind = Literal["root", "reporting", "adopted", "rejected", "pruned"]
 
 
 class RsiUsageTokens(BaseModel):
@@ -107,11 +111,11 @@ class RsiTreeNode(BaseModel):
     node_id: str
     iteration: int
     parent_id: str | None
-    type: Literal["root", "reporting"]
+    type: Literal["root", "reporting", "pruned"]
     adopted: bool
     # The candidate's composite paper score (judge.py::score_paper's
-    # `overall`). Null for root, pending, and any node the pipeline never
-    # produced a scorable paper for (failed run, scoring error).
+    # `overall`). Root carries the uploaded baseline score when the input is
+    # a scorable LaTeX source; pending and unscorable nodes remain null.
     score: float | None = None
     summary: str | None = None
     snapshot_artifact_id: str | None = None
@@ -124,6 +128,42 @@ class RsiTreeNode(BaseModel):
     def paper_extra(self) -> PaperNodeExtra | None:
         raw = self.extra.get("paper")
         return PaperNodeExtra.model_validate(raw) if raw is not None else None
+
+
+# Display-only labels for RsiTreeNode.failure_class, keyed by the exact
+# strings orchestrator.py writes. Not exhaustive by design: an unrecognized
+# failure_class (including None, for an adopted node) falls back to the raw
+# `reason` untouched in friendly_failure_reason() below rather than raising
+# or guessing at a translation.
+_FAILURE_CLASS_LABELS: dict[str, str] = {
+    "pipeline_blocked": "研究流程判断当前方向已无法继续推进，提前终止本轮尝试",
+    "pipeline_failed": "本轮研究流程执行异常，提前终止本轮尝试",
+    "pipeline_incomplete": "本轮尝试超出调度轮次预算，提前终止本轮尝试",
+    "scoring_error": "论文评分服务异常，本轮暂无法完成评分",
+    "rejected_by_score": "本轮论文质量未超过当前最佳版本，未被采纳",
+    "terminated": "任务被手动终止",
+    "crashed": "系统出现意外错误，本轮尝试提前终止",
+}
+
+
+def friendly_failure_reason(node: RsiTreeNode) -> str | None:
+    """Display-facing version of `node.reason` for a Provider consumer
+    (frontend/EventNode/TreeResponse) -- prefixes a plain-language category
+    label ahead of the existing technical detail, never replaces it.
+
+    Deliberately NOT used to overwrite the stored `reason`: that field also
+    feeds `PaperTaskState.last_reason` -> the *next* round's seed prompt
+    (see orchestrator.py's `_run_one_node`/`seed.py::build_node_seed`), and
+    the model needs the technical detail there, not a friendly summary.
+    Callers apply this only at the boundary where a node is about to leave
+    the orchestrator/storage layer for a Provider consumer.
+    """
+    if node.reason is None:
+        return None
+    label = _FAILURE_CLASS_LABELS.get(node.failure_class or "")
+    if label is None:
+        return node.reason
+    return f"{label}（详情：{node.reason}）"
 
 
 class TreeResponse(BaseModel):
@@ -163,6 +203,8 @@ class EngineReport(BaseModel):
     usage: RsiUsage | None = None
     artifact_index: list[ArtifactRef] = Field(default_factory=list)
     summary: str | None = None
+    best_score: float | None = None
+    baseline: float | None = None
 
 
 class ArtifactValidationResult(BaseModel):
@@ -223,6 +265,13 @@ class PaperTaskState(BaseModel):
     # *reporting* node has actually been adopted. Root (type="root", never
     # has an artifact) must never be assigned here.
     best_node_id: str | None = None
+    # Current best composite score and the score used as the task baseline.
+    # For an uploaded LaTeX paper, baseline is scored before the first
+    # candidate. For instruction-only tasks, the first adopted candidate is
+    # the baseline by design.
+    score: float | None = None
+    baseline: float | None = None
+    usage: RsiUsage | None = None
     # Internal-only: root or the most recently adopted reporting node --
     # the parent/comparison baseline _frontier_node() resolves for the
     # *next* round. Starts at root (see _ensure_root_node) and is what lets

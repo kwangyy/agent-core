@@ -56,8 +56,7 @@ class EvaluatorConfig:
     evaluation_method: str = "script-based"
     judge_model_config_ref: str = ""
     judge_agent_max_iterations: int = 8
-    judge_agent_max_tokens: int = 8192
-    judge_timeout_sec: int = 300
+    judge_timeout_sec: int = 900
     judge_max_retries: int = 2
     judge_success_score: float = 0.8
     transient_case_retry_limit: int = 2
@@ -77,8 +76,7 @@ class EvaluatorConfig:
             evaluation_method=str(data.get("evaluation_method", "script-based")),
             judge_model_config_ref=str(data.get("judge_model_config_ref", "")),
             judge_agent_max_iterations=_int_value(data.get("judge_agent_max_iterations"), default=8),
-            judge_agent_max_tokens=_int_value(data.get("judge_agent_max_tokens"), default=8192),
-            judge_timeout_sec=_int_value(data.get("judge_timeout_sec"), default=300),
+            judge_timeout_sec=_int_value(data.get("judge_timeout_sec"), default=900),
             judge_max_retries=_int_value(data.get("judge_max_retries"), default=2),
             judge_success_score=float(data.get("judge_success_score", 0.8)),
             transient_case_retry_limit=_int_value(
@@ -110,7 +108,6 @@ class EvaluationResultAnalyzerConfig:
     diagnosis_agent_max_retries: int = DEFAULT_MODEL_CALL_MAX_RETRIES
     diagnosis_agent_max_concurrency: int = 5
     diagnosis_agent_max_iterations: int = 20
-    diagnosis_agent_max_tokens: int = 16384
     causal_investigation_required: bool = True
     max_issues: int = 20
     evidence_limit_per_issue: int = 5
@@ -132,10 +129,6 @@ class EvaluationResultAnalyzerConfig:
             diagnosis_agent_max_iterations=_int_value(
                 data.get("diagnosis_agent_max_iterations"),
                 default=20,
-            ),
-            diagnosis_agent_max_tokens=_int_value(
-                data.get("diagnosis_agent_max_tokens"),
-                default=16384,
             ),
             causal_investigation_required=_bool_value(
                 data.get("causal_investigation_required"),
@@ -252,6 +245,7 @@ class OrchestratorSchedulingConfig:
     coordination_strategy: str = "team_first_single_pass"
     promotion_policy: str = "epoch_full_evaluation"
     full_evaluation_enabled: bool = True
+    full_evaluation_concurrency: int = 2
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OrchestratorSchedulingConfig":
@@ -260,11 +254,16 @@ class OrchestratorSchedulingConfig:
             coordination_strategy=str(data.get("coordination_strategy", "team_first_single_pass")),
             promotion_policy=str(data.get("promotion_policy", "epoch_full_evaluation")),
             full_evaluation_enabled=_bool_value(data.get("full_evaluation_enabled"), default=True),
+            full_evaluation_concurrency=_int_value(data.get("full_evaluation_concurrency"), default=2),
         )
         config.validate()
         return config
 
     def validate(self) -> None:
+        if (isinstance(self.full_evaluation_concurrency, bool)
+                or not isinstance(self.full_evaluation_concurrency, int)
+                or self.full_evaluation_concurrency < 1):
+            raise ValueError("scheduling.full_evaluation_concurrency must be a positive integer")
         if self.evaluation_strategy != "hybrid":
             raise ValueError("scheduling.evaluation_strategy must be hybrid")
         if self.coordination_strategy != "team_first_single_pass":
@@ -313,6 +312,7 @@ class AutoCoordinatingHarnessConfig:
     def validate(self) -> None:
         if self.max_epochs < 1:
             raise ValueError("max_epochs must be greater than or equal to 1")
+        self.scheduling.validate()
         if self.data_loader.batch_size < 1:
             raise ValueError("data_loader.batch_size must be greater than or equal to 1")
         if not self.data_loader.batch_balance_keys:
