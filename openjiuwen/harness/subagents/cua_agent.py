@@ -33,6 +33,7 @@ from openjiuwen.harness.tools.cua.rails import (
     CuaScreenshotDownscaleRail,
     CuaSnapshotDedupRail,
     CuaSnapshotFreshnessRail,
+    CuaUserTakeoverRail,
 )
 
 try:
@@ -259,6 +260,7 @@ def build_cua_agent_config(
     cua_delivery_mode: Optional[Literal["background", "foreground"]] = None,
     cua_screenshot_multimodal: bool = False,
     cua_snapshot_keep_last_k: int = 3,
+    cua_pause_on_user_input: bool = True,
     permissions: Optional[dict] = None,
     permission_host: Optional[Any] = None,
 ) -> SubAgentConfig:
@@ -308,6 +310,7 @@ def build_cua_agent_config(
             "cua_delivery_mode": cua_delivery_mode,
             "cua_screenshot_multimodal": cua_screenshot_multimodal,
             "cua_snapshot_keep_last_k": cua_snapshot_keep_last_k,
+            "cua_pause_on_user_input": bool(cua_pause_on_user_input),
             # Only present when provided so older configs keep their exact
             # factory_kwargs shape; DeepAgentConfig owns the defaults.
             **({"permissions": permissions} if permissions is not None else {}),
@@ -338,6 +341,7 @@ def create_cua_agent(
     cua_delivery_mode: Optional[Literal["background", "foreground"]] = None,
     cua_screenshot_multimodal: bool = False,
     cua_snapshot_keep_last_k: int = 3,
+    cua_pause_on_user_input: bool = True,
     **config_kwargs: Any,
 ) -> DeepAgent:
     """Create the cua desktop subagent with a task-scoped tool allowlist.
@@ -359,6 +363,12 @@ def create_cua_agent(
     image input (requires a vision-capable ``model``). Off by default: the
     agent then perceives through element trees and structured content only,
     with screenshots reduced to text placeholders.
+
+    ``cua_pause_on_user_input`` installs :class:`CuaUserTakeoverRail`: desktop
+    actions are held while the user is using the machine (mouse/keyboard input
+    seen by the OS) and released once it has been idle again; a takeover that
+    outlasts the rail's wait budget ends the delegation with a report. On by
+    default; inert on hosts without a user-activity probe.
 
     ``cua_snapshot_keep_last_k`` is how many recent desktop snapshots stay in
     context: it drives both the tool-result window on the snapshot tools and,
@@ -427,6 +437,12 @@ def create_cua_agent(
     # per-call model decision against the driver's own default.
     if cua_delivery_mode is not None:
         injected_rails.append(CuaDeliveryModeRail(mcp_cfg, cua_delivery_mode))
+
+    if cua_pause_on_user_input:
+        takeover_rail = CuaUserTakeoverRail(mcp_cfg)
+        if not takeover_rail.active:
+            logger.info("cua user-takeover pause requested but no user-activity probe exists on this host")
+        injected_rails.append(takeover_rail)
 
     if cua_screenshot_multimodal:
         injected_rails.append(CuaScreenshotDownscaleRail(mcp_cfg))
