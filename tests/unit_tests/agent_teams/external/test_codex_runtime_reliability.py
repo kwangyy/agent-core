@@ -13,6 +13,7 @@ import pytest
 from openjiuwen.agent_teams.external.cli_agent.codex.runtime import CodexSdkRuntime
 from openjiuwen.agent_teams.schema.external_runtime_reliability import (
     ExternalRuntimeFailure,
+    ExternalRuntimeFailureReason,
 )
 from tests.test_logger import logger
 
@@ -40,6 +41,7 @@ class _FakeTurnHandle:
 class _FakeThread:
     def __init__(self, turns):
         self.id = "thread-1"
+        self.model = "gpt-thread-effective"
         self._turns = list(turns)
 
     async def turn(self, prompt: str):
@@ -162,8 +164,32 @@ async def _start(runtime):
 
 
 @pytest.mark.asyncio
+async def test_codex_reliability_context_reports_configured_cli_path() -> None:
+    runtime, mm, messager, sink = _build_runtime([])
+    runtime._config.codex_bin = "/opt/codex"
+    runtime.bind_reliability_context(
+        session_id="session",
+        team_backend=SimpleNamespace(team_name="team", message_manager=mm),
+        leader_name="leader",
+        update_status_cb=sink,
+        messager=messager,
+    )
+    runtime._reliability_ctx.begin_attempt(phase="startup", round_id=None)
+
+    await runtime._reliability_ctx.finalize_failure(
+        category="process_start_failed",
+        reason=ExternalRuntimeFailureReason(message="failed"),
+        summary="startup failed",
+    )
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.cli_path == "/opt/codex"
+
+
+@pytest.mark.asyncio
 async def test_codex_will_retry_publishes_retrying_event():
     notifications = [
+        _notification("model/rerouted", from_model="gpt-original", to_model="gpt-effective"),
         _notification(
             "error",
             error=SimpleNamespace(message="overloaded", codex_error_info="serverOverloaded"),
@@ -178,7 +204,139 @@ async def test_codex_will_retry_publishes_retrying_event():
     # No failed message — only a retrying event.
     assert len(mm.sent) == 0
     assert len(messager.published) == 1
+    _topic_id, event_message = messager.published[0]
+    retrying = event_message.get_payload()
+    assert retrying.model == "gpt-effective"
+    assert retrying.reason.message == "overloaded"
+    assert retrying.attempt == 1
+    assert retrying.max_attempts == 5
     logger.info("retrying published, no failure message")
+
+
+@pytest.mark.asyncio
+async def test_codex_retry_detail_survives_terminal_retry_exhaustion():
+    from openai_codex.generated.v2_all import (
+        ResponseTooManyFailedAttempts,
+        ResponseTooManyFailedAttemptsCodexErrorInfo,
+    )
+
+    terminal_info = ResponseTooManyFailedAttemptsCodexErrorInfo(
+        response_too_many_failed_attempts=ResponseTooManyFailedAttempts(http_status_code=429),
+    )
+    notifications = [
+        _notification(
+            "error",
+            error=SimpleNamespace(
+                message="provider rejected the request",
+                additional_details="provider diagnostic id: detail-1",
+                codex_error_info="usageLimitExceeded",
+            ),
+            will_retry=True,
+        ),
+        _notification(
+            "turn/completed",
+            turn=SimpleNamespace(
+                status="failed",
+                error=SimpleNamespace(
+                    message="exceeded retry limit, last status: 429 Too Many Requests",
+                    additional_details=None,
+                    codex_error_info=terminal_info,
+                ),
+            ),
+        ),
+    ]
+    runtime, mm, _messager, _sink = _build_runtime(notifications)
+    await _start(runtime)
+
+    async for _chunk in runtime._drive({"query": "hi"}):
+        pass
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.category == "quota_exceeded"
+    assert failure.user_action_required is True
+    assert failure.reason.sdk_error_code == "usageLimitExceeded"
+    assert failure.reason.http_status == 429
+    assert "provider diagnostic id: detail-1" in failure.reason.message
+    assert "exceeded retry limit" in failure.reason.message
+
+
+@pytest.mark.asyncio
+async def test_codex_retry_exhaustion_reports_unknown_upstream_cause():
+    from openai_codex.generated.v2_all import (
+        ResponseTooManyFailedAttempts,
+        ResponseTooManyFailedAttemptsCodexErrorInfo,
+    )
+
+    terminal_info = ResponseTooManyFailedAttemptsCodexErrorInfo(
+        response_too_many_failed_attempts=ResponseTooManyFailedAttempts(http_status_code=429),
+    )
+    notifications = [
+        _notification(
+            "turn/completed",
+            turn=SimpleNamespace(
+                status="failed",
+                error=SimpleNamespace(
+                    message="exceeded retry limit, last status: 429 Too Many Requests",
+                    additional_details=None,
+                    codex_error_info=terminal_info,
+                ),
+            ),
+        ),
+    ]
+    runtime, mm, _messager, _sink = _build_runtime(notifications)
+    await _start(runtime)
+
+    async for _chunk in runtime._drive({"query": "hi"}):
+        pass
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.category == "rate_limited"
+    assert failure.reason.sdk_error_code == "responseTooManyFailedAttempts"
+    assert "did not provide a specific upstream cause" in failure.summary
+    assert "显式触发新的 round" in failure.suggested_action
+    assert "账户额度" not in failure.suggested_action
+
+
+@pytest.mark.asyncio
+async def test_codex_terminal_failure_keeps_pending_for_later_round() -> None:
+    from openai_codex.generated.v2_all import (
+        ResponseTooManyFailedAttempts,
+        ResponseTooManyFailedAttemptsCodexErrorInfo,
+    )
+
+    terminal_info = ResponseTooManyFailedAttemptsCodexErrorInfo(
+        response_too_many_failed_attempts=ResponseTooManyFailedAttempts(http_status_code=429),
+    )
+    failed_turn = [
+        _notification(
+            "turn/completed",
+            turn=SimpleNamespace(
+                status="failed",
+                error=SimpleNamespace(
+                    message="exceeded retry limit, last status: 429 Too Many Requests",
+                    additional_details=None,
+                    codex_error_info=terminal_info,
+                ),
+            ),
+        ),
+    ]
+    pending_turn = [_notification("turn/completed", turn=SimpleNamespace(status="completed"))]
+    runtime, mm, _messager, _sink = _build_runtime(failed_turn)
+    await _start(runtime)
+    thread = runtime._thread
+    assert isinstance(thread, _FakeThread)
+    thread._turns.append(pending_turn)
+    runtime._current_round_id = 1
+    await runtime.follow_up("task-board")
+
+    async for _chunk in runtime._drive({"query": "member-start"}):
+        pass
+
+    assert len(mm.sent) == 1
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.round_id == 1
+    assert runtime._pending == ["task-board"]
+    assert thread._turns == [pending_turn]
 
 
 @pytest.mark.asyncio
@@ -200,6 +358,7 @@ async def test_codex_turn_final_401_finalizes_auth_required():
     assert len(mm.sent) == 1
     failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
     assert failure.category == "auth_required"
+    assert failure.model == "gpt-thread-effective"
     assert failure.round_id == 5
     # In-turn failure does NOT mark ERROR; member returns to READY.
     assert sink.statuses == []
@@ -256,7 +415,7 @@ async def test_codex_pending_only_when_no_turn_error():
 
 
 @pytest.mark.asyncio
-async def test_codex_bad_request_is_sdk_error():
+async def test_codex_bad_request_is_request_rejected():
     notifications = [
         _notification(
             "turn/completed",
@@ -271,8 +430,8 @@ async def test_codex_bad_request_is_sdk_error():
     async for _chunk in runtime._drive({"query": "hi"}):
         pass
     failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
-    assert failure.category == "sdk_error"
-    logger.info("badRequest -> sdk_error")
+    assert failure.category == "request_rejected"
+    logger.info("badRequest -> request_rejected")
 
 
 @pytest.mark.asyncio
@@ -358,6 +517,26 @@ async def test_codex_startup_auth_exception_does_not_activate_fallback():
 
 
 @pytest.mark.asyncio
+async def test_codex_checkpoint_restore_failure_is_reported_as_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, mm, _messager, sink = _build_runtime([])
+
+    def fail_restore() -> None:
+        raise RuntimeError("checkpoint unavailable")
+
+    monkeypatch.setattr(runtime, "_restore_thread_id", fail_restore)
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await _start(runtime)
+
+    failure = ExternalRuntimeFailure.model_validate_json(mm.sent[0]["content"])
+    assert failure.phase == "startup"
+    assert failure.reason.message == "checkpoint unavailable"
+    assert [status.value for status in sink.statuses] == ["error"]
+
+
+@pytest.mark.asyncio
 async def test_codex_auth_failure_retries_once_on_promoted_fallback():
     """An output-free auth failure resumes the same thread on fallback."""
     native_notifications = [
@@ -414,15 +593,40 @@ async def test_codex_auth_failure_retries_once_on_promoted_fallback():
 
 
 @pytest.mark.asyncio
-async def test_codex_auth_will_retry_switches_to_fallback_immediately():
-    """A structured retryable authentication failure bypasses the native retry budget."""
-    native_notifications = [
-        _notification(
-            "error",
-            error=SimpleNamespace(message="unauthorized", codex_error_info="unauthorized"),
-            will_retry=True,
+async def test_codex_auth_will_retry_notifies_until_terminal_failure_then_switches_to_fallback() -> None:
+    """Structured authentication retries are surfaced before the fallback runs."""
+    from openai_codex.generated.v2_all import (
+        CodexErrorInfo,
+        ResponseStreamDisconnected,
+        ResponseStreamDisconnectedCodexErrorInfo,
+    )
+
+    retry_error_info = CodexErrorInfo(
+        root=ResponseStreamDisconnectedCodexErrorInfo(
+            response_stream_disconnected=ResponseStreamDisconnected(http_status_code=401),
         ),
-    ]
+    )
+    native_notifications = []
+    for attempt in range(1, 6):
+        native_notifications.append(
+            _notification(
+                "error",
+                error=SimpleNamespace(
+                    message=f"Reconnecting... {attempt}/5",
+                    codex_error_info=retry_error_info,
+                ),
+                will_retry=True,
+            ),
+        )
+    native_notifications.append(
+        _notification(
+            "turn/completed",
+            turn=SimpleNamespace(
+                status="failed",
+                error=SimpleNamespace(message="request failed", codex_error_info="other"),
+            ),
+        ),
+    )
     fallback_notifications = [
         _notification("turn/completed", turn=SimpleNamespace(status="completed")),
     ]
@@ -477,8 +681,91 @@ async def test_codex_auth_will_retry_switches_to_fallback_immediately():
     assert runtime._fallback_activated is True
     assert runtime._will_retry_count == 0
     assert promotions == 1
-    assert messager.published == []
+    assert len(messager.published) == 5
+    retrying_events = [message.get_payload() for _topic_id, message in messager.published]
+    assert [event.category for event in retrying_events] == ["auth_required"] * 5
+    assert [event.attempt for event in retrying_events] == list(range(1, 6))
+    assert all(event.max_attempts == 5 for event in retrying_events)
+    assert all(event.model == "gpt-thread-effective" for event in retrying_events)
+    assert mm.sent == []
     assert fallback_client.resume_calls == [
         ("thread-1", {"model": "fallback"}),
     ]
     assert runtime._thread_id == "thread-1"
+
+
+@pytest.mark.asyncio
+async def test_codex_auth_retry_budget_exhaustion_switches_to_fallback() -> None:
+    """Authentication retry budget exhaustion activates the configured fallback."""
+    native_notifications = [
+        _notification(
+            "error",
+            error=SimpleNamespace(message="retry 1", codex_error_info="unauthorized"),
+            will_retry=True,
+        ),
+        _notification(
+            "error",
+            error=SimpleNamespace(message="retry 2", codex_error_info="unauthorized"),
+            will_retry=True,
+        ),
+    ]
+    fallback_notifications = [
+        _notification("turn/completed", turn=SimpleNamespace(status="completed")),
+    ]
+    native_config = SimpleNamespace(name="native", env={}, cwd=None, codex_bin=None)
+    fallback_config = SimpleNamespace(name="fallback", env={}, cwd=None, codex_bin=None)
+    native_client = _FakeAsyncCodex(config=native_config, thread=_FakeThread([native_notifications]))
+    fallback_client = _FakeAsyncCodex(config=fallback_config, thread=_FakeThread([fallback_notifications]))
+    clients = {"native": native_client, "fallback": fallback_client}
+    sdk = SimpleNamespace(AsyncCodex=lambda *, config: clients[config.name])
+
+    async def promote() -> bool:
+        return True
+
+    runtime = CodexSdkRuntime(
+        member_name="developer",
+        member_agent_id="team_developer",
+        team_name="team",
+        team_session_id="session",
+        sdk=sdk,
+        config=native_config,
+        thread_options={"ephemeral": False},
+        fallback_config=fallback_config,
+        fallback_thread_options={"ephemeral": False, "model": "fallback"},
+        promote_fallback_model=promote,
+        turn_idle_timeout_s=30.0,
+        turn_idle_retries=0,
+        max_will_retry_count=1,
+    )
+    runtime._test_team_session = _FakeTeamSession(_FakeMemberSession())
+    mm = _FakeMessageManager()
+    messager = _FakeMessager()
+    sink = _StatusSink()
+    from openjiuwen.agent_teams.external.reliability import RuntimeReliabilityContext
+
+    runtime._reliability_ctx = RuntimeReliabilityContext(
+        member_name="developer",
+        team_name="team",
+        session_id="session",
+        agent_kind="codex",
+        message_manager=mm,
+        messager=messager,
+        leader_name="leader",
+        update_status_cb=sink,
+    )
+    await _start(runtime)
+
+    async for _chunk in runtime._drive({"query": "hi"}):
+        pass
+
+    assert native_client.closed is True
+    assert runtime._fallback_activated is True
+    assert len(messager.published) == 1
+    retrying = messager.published[0][1].get_payload()
+    assert retrying.category == "auth_required"
+    assert retrying.attempt == 1
+    assert retrying.max_attempts == 1
+    assert mm.sent == []
+    assert fallback_client.resume_calls == [
+        ("thread-1", {"model": "fallback"}),
+    ]

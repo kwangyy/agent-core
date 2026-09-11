@@ -135,7 +135,7 @@ task.py            # TaskSummary / TaskDetail —— 任务返回模型
 - `TeamRuntimeContext`：运行时上下文，携带 role / messager_config / db_config 等资源配置，是 `Spec → Runtime` 的边界。
 - 新增 spec 字段要想清楚：**属于装配数据**（放 Spec）还是**运行时资源**（放 Config/Manager/Runtime）。不要让 Spec 持有 `Runner`、`Session`、文件句柄。
 - **Session checkpoint 状态结构按 team 分桶**：`session.update_state` 的全局状态根上有一个 `teams` namespace —— `state["teams"][team_name] = {spec, context, model_allocator_state, lifecycle, db_state, pending_resume}`。同一 session 可以承载多个 team 的状态；读写一律走 `runtime/metadata.py` 的 `read_team_namespace / merge_team_namespace / read_team_db_state / merge_team_db_state / read_pending_resume / merge_pending_resume / clear_pending_resume`，不要直接在 root 上 `update_state({"spec": ...})`。`db_state` 用 `pending_create / created / cleaned` 标记 team DB row 生命周期；`pending_resume`（`{"query": ...}`，leader-only）由 `kernel.pause` 写、`kernel.start` 尾部消费，使 `pause → stop → start` 等价于 `pause → resume`（见 [[F_61]]）。
-- `MemberStatus` 状态流转：`UNSTARTED`（DB 记录已创建，agent 进程未启动）→ `STARTING`（CAS guard 占位，正在 spawn）→ `READY`（agent 进程已就绪）→ `BUSY`/`PAUSED`/`STOPPED`/`SHUTDOWN`/`ERROR`。`STARTING` 是过渡态——只有第一个 startup 路径能 CAS 成功 `UNSTARTED→STARTING`，第二个并发路径查到 STARTING/READY 直接跳过。spawn 失败时 rollback `STARTING→UNSTARTED` 保证可重试。`PAUSED` 是自然 round-end idle（persistent team）；`STOPPED` 是外部 `stop_team` 拆掉 runtime、但 team 仍 live；`SHUTDOWN` 是永久退场。`BUSY`/`PAUSED`/`STOPPED`/`SHUTDOWN` 可经 `RESTARTING` 复活。`schema.team.TeamLifecycle`（temporary / persistent）描述静态团队类型，`runtime.pool.RuntimeState`（running / paused）描述对象池中 team 的运行时状态——和 MemberStatus 是不同层次的枚举，不要混用。
+- `MemberStatus` 状态流转：`UNSTARTED`（DB 记录已创建，agent 进程未启动）→ `STARTING`（CAS guard 占位，正在 spawn）→ `READY`（agent 进程已就绪）→ `BUSY`/`PAUSED`/`STOPPED`/`SHUTDOWN`/`ERROR`。`STARTING` 是过渡态——只有第一个 startup 路径能 CAS 成功 `UNSTARTED→STARTING`，第二个并发路径查到 STARTING/READY 直接跳过。spawn 失败时 rollback `STARTING→UNSTARTED` 保证可重试。`PAUSED` 是自然 round-end idle（persistent team）；`STOPPED` 是外部 `stop_team` 拆掉 runtime、但 team 仍 live；`ERROR` 保留真实失败并等待显式消息/调度或冷恢复；`SHUTDOWN` 是显式退场，冷恢复不得自动复活（状态表保留 `SHUTDOWN→RESTARTING` 仅供显式复活能力）。`schema.team.TeamLifecycle`（temporary / persistent）描述静态团队类型，`runtime.pool.RuntimeState`（running / paused）描述对象池中 team 的运行时状态——和 MemberStatus 是不同层次的枚举，不要混用。
 - **成员状态的三组子集回答三个不同问题，任何两组都不要合并**：`MEMBER_DEPARTED_STATUSES` / `MEMBER_UNREACHABLE_STATUSES`（退场的两道门槛，见 `status.py` 头部注释）；`MEMBER_SETTLED_STATUSES`（"干完了吗"，喂团队完成判定，故排除 `UNSTARTED` / `ERROR`）；`MEMBER_QUIESCENT_STATUSES`（"现在动没动"，喂 leader 的 team-idle 信号，故包含 `UNSTARTED` / `ERROR`，活跃补集是 `STARTING` / `BUSY` / `RESTARTING` / `SHUTDOWN_REQUESTED`）。见 [[F_74_leader-member-activity-and-team-idle]]。
 - **leader 的流上有三种框架标记 chunk**（都是 `TeamOutputSchema`，`payload.event_type` 以 `team.` 开头）：`team.completed`（完成，随后关流）、`team.idle`（全员静止**持续 2s**、**且**其后复查任务板无非终态任务（空板也算）才发，**不关流**；窗口内任一成员再动就取消，见 [[F_77_team-idle-requires-a-settled-task-board]]）、`team.interact.failed`（首轮路由失败）。`is_team_event_marker` 是它们的统一判定，`TeamAgent.invoke` 用它把标记排除在返回值之外——非流式调用方要的是 agent 产出的内容，不是框架记账。
 - `TeamOutputSchema` 是 `core.session.stream.OutputSchema` 的子类（不污染 core 层），扩出 `source_member: str | None` 与 `role: TeamRole | None`。`Runner.run_agent_team_streaming` 的所有输出 chunk 在 team 路径下都会被 `StreamController` 自动升级为 `TeamOutputSchema` 并打上 `(member_name, role)` 标签。**inprocess 模式**下，`SpawnManager` 在 spawn teammate 时通过 `StreamController.add_chunk_observer` 把 teammate chunk fan-out 到 leader 的 `stream_queue`，让 leader 的 streaming 流出全成员 chunk；subprocess 模式不做转发（chunk 留在 teammate 进程内），扩展点已留好（messager-driven observer）。详见 `agent/AGENTS.md` 的 StreamController 段。
@@ -266,14 +266,16 @@ provider session/Turn 协议合并。
 - **member**（cli-agent 三方团队成员）：`ExternalTeamClient.connect` 建最小 `TeamBackend` +
   `create_team_tools(role="teammate")`，对外暴露**真实** teammate `TeamTool`
   （`view_task` / `claim_task[claimed|completed]` / `send_message`，结果即 `map_result()`
-  文本，与进程内成员逐字一致）+ 外部专有 `read_inbox`（原生 push、外部 pull）。`complete_task`
+  文本，与进程内成员逐字一致）。入站消息与原生成员同路——父进程 coordination push 进 CLI，
+  **不暴露** pull 工具（operator 专有的 `read_inbox` 对 member 不可见）。`complete_task`
   折进 `claim_task(status=completed)`、list/get/claimable 折进 `view_task`。MCP instructions
   空（系统提示词已在 spawn 时直接注入 CLI，见 [[F_25]]）。
 - **operator**（团队外非成员控制接口，默认 scope）：`ExternalTeamClient` 的 per-op 方法
   （send/broadcast/list/get/claimable/claim/complete/update/list_members + `create_task`）+
-  `fetch_inbox`/`watch`，全团队控制面；MCP instructions = 控制工作流。
+  `fetch_inbox`/`watch`，全团队控制面；operator 没有自己的 coordination 层，MCP 工具集
+  含 operator 专有的 `read_inbox` pull 工具；MCP instructions = 控制工作流。
 
-公共件：`client.tools`（member 真实工具字典）、`client.read_inbox()`（`<team-inbound>`/`<team-event>` XML）、
+公共件：`client.tools`（member 真实工具字典）、`client.read_inbox()`（operator 侧 pull，`<team-inbound>`/`<team-event>` XML）、
 `client.bind_session_context()`（每调用重绑 session/language contextvar）。
 - `external/format.py`：纯函数把消息 / 任务板渲染成与进程内 dispatcher 一致的
   `<team-inbound>`/`<team-event>` XML（复用 `inbound_render` 结构 + `i18n.t` note 文案）；

@@ -22,6 +22,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.models.allocator import Allocation
+    from openjiuwen.agent_teams.schema.team import ModelPoolEntry
     from openjiuwen.agent_teams.team_workspace.manager import TeamWorkspaceManager
     from openjiuwen.agent_teams.team_workspace.workspace_cache import WorkspaceCache
 
@@ -111,6 +112,9 @@ class TeamBackend:
         enable_hitt: bool = False,
         enable_bridge: bool = False,
         *,
+        model_pool_provider: Callable[[], list["ModelPoolEntry"]] | None = None,
+        current_model_name: str | None = None,
+        current_model_provider: str | None = None,
         dispatch_mode: str = "autonomous",
         enable_task_verification: bool = False,
         enable_fork: bool = False,
@@ -121,6 +125,8 @@ class TeamBackend:
         on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
         on_team_built: Callable[[], Awaitable[None]] | None = None,
         on_member_started: Callable[[str], Awaitable[None]] | None = None,
+        on_member_restarted: Callable[[str], Awaitable[bool]] | None = None,
+        on_member_stopped: Callable[[str], Awaitable[None]] | None = None,
         plan_storage_dir: str | None = None,
         plan_id: str | None = None,
         leader_member_name: str | None = None,
@@ -148,6 +154,14 @@ class TeamBackend:
                 ``build_team`` as ``{model_name, model_index}`` so the
                 assignment is auditable and survives full-restart
                 recovery via positional lookup against the live pool.
+            model_pool_provider: Returns the current team model pool for
+                validating external CLI fallback choices. The callback keeps
+                runtime pool updates visible without copying credentials into
+                the backend.
+            current_model_name: Name of the model currently driving this
+                member, used to prioritize an allocatable fallback.
+            current_model_provider: Provider of the current member model,
+                used to derive its model API protocol.
             enable_hitt: Spec-level HITT capability ceiling. When
                 False, every human-agent spawn path returns failure;
                 when True, the runtime instance flag (mutated by
@@ -199,6 +213,10 @@ class TeamBackend:
                 ``autostart_unstarted``; leaving it None turns every
                 auto-start into a no-op, which is what an external
                 (out-of-process) backend wants — it has no process to spawn.
+            on_member_restarted: Optional async callback that replaces a dead
+                member runtime. Used after an atomic ERROR→RESTARTING claim.
+            on_member_stopped: Optional async callback that removes a dead
+                member's stale runtime handle after ERROR→SHUTDOWN settles.
             leader_prompt: The leader's private prompt (``LeaderSpec.prompt``
                 via ``ctx.prompt``). Persisted on the leader's DB row at
                 ``build_team`` so cold-recovery — which rebuilds the leader
@@ -223,6 +241,9 @@ class TeamBackend:
         self.teammate_mode = teammate_mode
         self.predefined_members = predefined_members or []
         self._allocate_model_config = model_config_allocator
+        self._model_pool_provider = model_pool_provider
+        self.current_model_name = str(current_model_name or "").strip() or None
+        self.current_model_provider = str(current_model_provider or "").strip() or None
         self.leader_allocation = leader_allocation
         # Leader's private prompt (LeaderSpec.prompt via ctx.prompt). Persisted
         # on the leader's DB row at build_team so cold-recovery, which rebuilds
@@ -277,6 +298,8 @@ class TeamBackend:
         # Spawns one member's agent process. The single injection point for
         # every auto-start path that goes through ``autostart_unstarted``.
         self._on_member_started = on_member_started
+        self._on_member_restarted = on_member_restarted
+        self._on_member_stopped = on_member_stopped
 
         self.task_manager = TeamTaskManager(
             self.team_name,
@@ -350,6 +373,12 @@ class TeamBackend:
         self._checkpoint_list_fn: Callable[[], dict] | None = None
 
         team_logger.info(f"AgentTeam manager initialized for {team_name}, member={member_name}")
+
+    def get_model_pool(self) -> list["ModelPoolEntry"]:
+        """Return a snapshot of the current team model pool."""
+        if self._model_pool_provider is None:
+            return []
+        return list(self._model_pool_provider())
 
     def register_cleanup_path(self, path: Optional[str]) -> None:
         """Register a filesystem path to remove on ``clean_team``.
@@ -834,6 +863,47 @@ class TeamBackend:
 
         return True
 
+    async def recover_member(self, member_name: str) -> bool:
+        """Restart one failed member after atomically claiming recovery.
+
+        Only ERROR members are eligible. The ERROR→RESTARTING CAS prevents a
+        direct message, scheduler handoff, and cold recovery from launching
+        duplicate runtimes. A failed restart returns the member to ERROR so a
+        later explicit nudge can try again.
+
+        Args:
+            member_name: The failed member to restart.
+
+        Returns:
+            True when this call restarted the member, otherwise False.
+        """
+        if not self.is_leader or self._on_member_restarted is None:
+            return False
+
+        transitioned = await self.db.member.try_transition_member_status(
+            member_name,
+            self.team_name,
+            MemberStatus.ERROR,
+            MemberStatus.RESTARTING,
+        )
+        if not transitioned:
+            return False
+
+        try:
+            restarted = await self._on_member_restarted(member_name)
+        except Exception as exc:
+            team_logger.error("Failed to recover member {}: {}", member_name, exc)
+            restarted = False
+
+        if not restarted:
+            await self.db.member.try_transition_member_status(
+                member_name,
+                self.team_name,
+                MemberStatus.RESTARTING,
+                MemberStatus.ERROR,
+            )
+        return restarted
+
     async def approve_plan(
         self,
         plan_id: str,
@@ -1024,6 +1094,26 @@ class TeamBackend:
                     t("team.shutdown_human_active_tasks",
                       member_name=member_name, count=str(len(active_tasks)), task_ids=task_ids)
                 )
+
+        # ERROR means the member runtime has already failed and cannot consume
+        # a mailbox request or shutdown event. Settle it directly; the CAS also
+        # arbitrates against a concurrent ERROR→RESTARTING recovery claim.
+        if current_status == MemberStatus.ERROR:
+            transitioned = await self.db.member.try_transition_member_status(
+                member_name,
+                self.team_name,
+                MemberStatus.ERROR,
+                MemberStatus.SHUTDOWN,
+            )
+            if not transitioned:
+                return MemberOpResult.fail(f"Member {member_name} lifecycle changed while shutting down")
+            if self._on_member_stopped is not None:
+                try:
+                    await self._on_member_stopped(member_name)
+                except Exception as exc:
+                    team_logger.warning("Failed to clean stale runtime for member {}: {}", member_name, exc)
+            team_logger.info("Shutdown failed member {} directly", member_name)
+            return MemberOpResult.success()
 
         # Validate state transition
         from openjiuwen.agent_teams.schema.status import (
