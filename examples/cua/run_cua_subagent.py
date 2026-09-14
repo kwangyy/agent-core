@@ -205,12 +205,12 @@ def _default_task() -> str:
 def _permissions_config() -> dict | None:
     """Tool-permission policy for the materialized cua subagent.
 
-    ``strict`` mode turns the CRITICAL shell rule into a hard DENY: a live
-    coordinator run showed the desktop agent improvising an elevated
-    PowerShell when Calculator ignored its background clicks, and a shell is
-    never an acceptable fallback for a GUI task. Known-safe demo apps are
-    pre-approved so the happy path never prompts; every other launch_app /
-    type_text asks through the hosted hook below.
+    The shell rule is a hard DENY: a live coordinator run showed the desktop
+    agent improvising an elevated PowerShell when Calculator ignored its
+    background clicks, and a shell is never an acceptable fallback for a GUI
+    task. Known-safe demo apps are pre-approved so the happy path never
+    prompts; every other launch_app / type_text asks through the hosted hook
+    below.
     """
     if _env_str("CUA_PERMISSIONS", default="1").lower() in ("0", "false", "no"):
         return None
@@ -219,6 +219,9 @@ def _permissions_config() -> dict | None:
         "schema": "tiered_policy",
         "permission_mode": "strict",
         "tools": {},
+        # Only reaches screenshot/click/etc.: the package builtin rules
+        # (cua_desktop_launch_app / cua_desktop_type_text) already ASK for
+        # every launch_app and type_text the overrides below don't pre-approve.
         "defaults": {"*": "allow"},
         "rules": [
             {
@@ -230,6 +233,10 @@ def _permissions_config() -> dict | None:
                     "re:(?i)^(powershell|pwsh|cmd|wt|conhost|wsl|bash|sh|"
                     "regedit|rundll32|mshta|cscript|wscript)(\\.exe)?$"
                 ),
+                # Explicit: the engine maps a bare severity to ASK (never
+                # DENY) and does not read permission_mode, so without this
+                # CUA_APPROVE=allow would wave a PowerShell launch through.
+                "action": "deny",
                 "severity": "CRITICAL",
             }
         ],
