@@ -341,6 +341,62 @@ async def test_user_input_after_the_agents_own_input_still_pauses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_slow_driver_round_trip_does_not_turn_the_agents_own_click_into_a_takeover() -> None:
+    # The OS input event happens when the driver injects the click, shortly
+    # after dispatch; the rail only learns the call is over when the MCP
+    # round-trip returns. Timestamping own input at return time made every
+    # round-trip slower than the grace window look like the user.
+    desk = _FakeDesktop([42.0, 2.4])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await rail.before_tool_call(click)  # dispatched at now=100, injected ~100.2
+    desk.now = 102.5  # driver took 2.5s to answer
+    _finish_call(click)
+    await rail.after_tool_call(click)
+    desk.now = 102.6
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)  # OS: last input 2.4s ago = the click
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_long_type_text_is_attributed_to_the_agent_until_its_last_keystroke() -> None:
+    # Typing a long string keeps injecting keystrokes until the call returns,
+    # so the last OS event sits near the END of the round-trip, not the start.
+    desk = _FakeDesktop([42.0, 0.3])
+    rail = _takeover_rail(desk)
+    typing = _tool_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "a long paragraph"})
+    await rail.before_tool_call(typing)  # dispatched at now=100
+    desk.now = 103.0  # last keystroke landed ~102.9
+    _finish_call(typing)
+    await rail.after_tool_call(typing)
+    desk.now = 103.2
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)  # OS: last input 0.3s ago = our keystroke
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_input_call_does_not_widen_the_agents_own_input_window() -> None:
+    # A call this rail rejected never reached the desktop. Recording it as own
+    # input would stretch the attribution window over the user's activity.
+    desk = _FakeDesktop([0.2])  # user never stops
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await rail.before_tool_call(click)
+    assert click.extra["_skip_tool"] is True
+    await rail.after_tool_call(click)
+
+    assert rail._last_own_input_at is None
+
+
+@pytest.mark.asyncio
 async def test_rail_is_inert_without_a_probe_and_for_non_cua_tools() -> None:
     desk = _FakeDesktop([0.1])
     no_probe = CuaUserTakeoverRail(_mcp_cfg(), probe=None, sleep=desk.sleep, monotonic=desk.monotonic)

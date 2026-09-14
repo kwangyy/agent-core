@@ -442,9 +442,13 @@ class CuaUserTakeoverRail(AgentRail):
       silent forever.
 
     Under foreground delivery the agent's own clicks and keystrokes are real
-    OS input too. An input event whose age matches the agent's last own input
-    action (within ``self_input_grace_s``) is attributed to the agent, not the
-    user. Without a probe (non-Windows hosts) the rail is inert.
+    OS input too. An input event that falls inside the agent's last own input
+    call -- from dispatch to the driver's reply, padded by
+    ``self_input_grace_s`` -- is attributed to the agent, not the user. The
+    whole call is the window because the OS event lands shortly after
+    dispatch for a click but near the reply for a long type_text, and a slow
+    MCP round-trip separates the two by more than any fixed grace. Without a
+    probe (non-Windows hosts) the rail is inert.
     """
 
     def __init__(
@@ -475,6 +479,7 @@ class CuaUserTakeoverRail(AgentRail):
         self._self_input_grace_s = float(self_input_grace_s)
         self._sleep = sleep
         self._monotonic = monotonic
+        self._own_input_dispatched_at: Optional[float] = None
         self._last_own_input_at: Optional[float] = None
         self._pending_note: Optional[str] = None
 
@@ -494,6 +499,7 @@ class CuaUserTakeoverRail(AgentRail):
         waited = 0.0
         idle = self._user_idle_seconds()
         if idle is None or idle >= self._active_within_s:
+            self._mark_own_input_dispatch(tool_name)
             return
         logger.warning(
             "[CuaUserTakeoverRail] user is using the desktop (idle %.1fs); holding %s", idle, tool_name
@@ -514,6 +520,12 @@ class CuaUserTakeoverRail(AgentRail):
         self._pending_note = _USER_TAKEOVER_RESUMED_NOTE.format(
             waited=waited, idle=self._resume_after_idle_s
         )
+        self._mark_own_input_dispatch(tool_name)
+
+    def _mark_own_input_dispatch(self, tool_name: str) -> None:
+        # Taken after any hold, so the window never covers the user's activity.
+        if tool_name in self._input_tool_names:
+            self._own_input_dispatched_at = self._monotonic()
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
@@ -522,7 +534,7 @@ class CuaUserTakeoverRail(AgentRail):
         tool_name = str(inputs.tool_name or "")
         if not tool_name.startswith(self._tool_prefix):
             return
-        if tool_name in self._input_tool_names:
+        if tool_name in self._input_tool_names and not ctx.extra.get("_skip_tool"):
             self._last_own_input_at = self._monotonic()
         if self._pending_note is not None:
             _append_advisory(inputs, self._pending_note)
@@ -533,10 +545,17 @@ class CuaUserTakeoverRail(AgentRail):
         if idle is None:
             return None
         if self._last_own_input_at is not None:
-            since_own = self._monotonic() - self._last_own_input_at
-            # The last OS input event coincides with our own injected action:
-            # that is the agent, not the user. Anything more recent is the user.
-            if abs(idle - since_own) <= self._self_input_grace_s:
+            last_event_at = self._monotonic() - idle
+            dispatched_at = self._own_input_dispatched_at
+            if dispatched_at is None or dispatched_at > self._last_own_input_at:
+                dispatched_at = self._last_own_input_at
+            # The last OS input event landed during our own input call: that is
+            # the agent, not the user. Anything more recent is the user.
+            if (
+                dispatched_at - self._self_input_grace_s
+                <= last_event_at
+                <= self._last_own_input_at + self._self_input_grace_s
+            ):
                 return float("inf")
         return idle
 
