@@ -175,6 +175,10 @@ _STATE_REVISIT_ADVISORY = (
 
 
 class CuaRuntimeRail(AgentRail):
+# Set on ctx.extra next to ``_skip_tool`` when CuaRepeatFailureRail refuses a
+# call, so CuaProgressRail can tell a hard block from an ordinary rejection.
+_REPEAT_BLOCKED_EXTRA_KEY = "_cua_repeat_blocked"
+
     """Lifecycle rail for the cua-driver MCP runtime.
 
     Run-scoped setup, cached after first success: verify the daemon is
@@ -1037,6 +1041,7 @@ class CuaRepeatFailureRail(AgentRail):
     def _reject_tool(ctx: AgentCallbackContext, inputs: ToolCallInputs, error_msg: str) -> None:
         """Hard-block a tool call using the shared rail contract."""
         tool_call = inputs.tool_call
+        ctx.extra[_REPEAT_BLOCKED_EXTRA_KEY] = True
         tool_call_id = tool_call.id if tool_call else ""
         ctx.extra["_skip_tool"] = True
         inputs.tool_result = {"error": error_msg}
@@ -1076,9 +1081,9 @@ class CuaProgressRail(AgentRail):
        parent as ``resume_context``, same shape/purpose as browser's but
        with cua-appropriate fields (no DOM concepts like missing_fields or
        current_page). ``status``/``recommended_recovery`` here are simple
-       heuristics derived from whether a blocker or the revisit threshold
-       was hit -- not an authoritative task-completion judgment the way
-       browser's phase-tracked status is.
+       heuristics derived from whether a blocker, a repeat-failure hard
+       block or the revisit threshold was hit -- not an authoritative
+       task-completion judgment the way browser's phase-tracked status is.
     """
 
     def __init__(self, mcp_cfg: McpServerConfig) -> None:
@@ -1107,9 +1112,13 @@ class CuaProgressRail(AgentRail):
         if not tool_name.startswith(self._tool_prefix):
             return
         if ctx.extra.get("_skip_tool"):
-            # A rail-side rejection never reached the driver.
+            # A rail-side rejection never reached the driver. A repeat-failure
+            # block is still terminal for the run: the model was thrashing on
+            # a call it cannot complete this way, and its earlier failures
+            # only ever registered as ordinary blockers (status "partial").
+            if ctx.extra.get(_REPEAT_BLOCKED_EXTRA_KEY):
+                self._hard_blocked.append(short_name)
             return
-        short_name = tool_name[len(self._tool_prefix) :]
         response = _response_text(inputs)
 
         if short_name in _SNAPSHOT_TOOLS:
@@ -1138,6 +1147,8 @@ class CuaProgressRail(AgentRail):
         inputs: ToolCallInputs,
         short_name: str,
         pid: Any,
+        # Short names of calls CuaRepeatFailureRail refused in this run.
+        self._hard_blocked: list = []
         window_id: Any,
         response: str,
     ) -> None:
@@ -1145,6 +1156,7 @@ class CuaProgressRail(AgentRail):
         comparable = _SNAPSHOT_IMAGE_PLACEHOLDER_RE.sub("[image content: <volatile>]", comparable)
         digest = hashlib.sha256(comparable.encode("utf-8")).hexdigest()
         key = (short_name, pid, window_id)
+        self._hard_blocked = []
         history = self._history.setdefault(key, collections.deque(maxlen=_STATE_REVISIT_HISTORY_SIZE))
 
         if digest not in history:
@@ -1153,6 +1165,7 @@ class CuaProgressRail(AgentRail):
 
         revisit_key = (key, digest)
         count = self._revisit_counts.get(revisit_key, 1) + 1
+        short_name = tool_name[len(self._tool_prefix) :]
         self._revisit_counts[revisit_key] = count
         if count >= _STATE_REVISIT_ADVISE_AFTER and revisit_key not in self._advised:
             self._advised.add(revisit_key)
@@ -1190,7 +1203,13 @@ class CuaProgressRail(AgentRail):
                 # Best-effort: an optional resume counter must never block the run.
                 logger.debug("[CuaProgressRail] resume_count tracking failed: %s", exc)
 
-        if self._advised:
+        if self._hard_blocked:
+            status = "blocked"
+            recovery = (
+                "A repeatedly failing call was hard-blocked ({tools}); that approach does not "
+                "work. Resume with different arguments or a different strategy for that step."
+            ).format(tools=", ".join(dict.fromkeys(self._hard_blocked)))
+        elif self._advised:
             status = "blocked"
             recovery = (
                 "Task appears to be cycling through the same desktop state; retry with a "

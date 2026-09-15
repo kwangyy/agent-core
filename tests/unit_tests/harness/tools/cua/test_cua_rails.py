@@ -1584,3 +1584,50 @@ async def test_progress_state_resets_between_invokes() -> None:
 
     ctx = await _snap(rail, "get_window_state", win, _WIN_A)
     assert "cycling" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_failure_hard_block_reports_the_run_as_blocked() -> None:
+    # A run CuaRepeatFailureRail cut off after N identical failures used to
+    # reach after_invoke with only ordinary blockers recorded, so the parent
+    # saw status="partial" and treated it as merely incomplete. A hard block
+    # means the model was thrashing on a step it cannot complete this way:
+    # that is a terminal signal and must surface as "blocked".
+    repeat = CuaRepeatFailureRail(_mcp_cfg(), advise_after=1, block_after=2)
+    progress = CuaProgressRail(_mcp_cfg())
+    await progress.before_invoke(_invoke_ctx())
+    args = {"pid": 1, "text": "hi"}
+
+    for _ in range(3):
+        ctx = _result_ctx("mcp_cua-driver_type_text", dict(args), _FAILURE)
+        await repeat.before_tool_call(ctx)
+        if not ctx.extra.get("_skip_tool"):
+            await repeat.after_tool_call(ctx)
+        await progress.after_tool_call(ctx)
+    assert ctx.extra.get("_skip_tool")
+
+    result: dict = {"output": "..."}
+    await progress.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "blocked"
+    assert "type_text" in result["cua_result"]["recommended_recovery"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_failures_below_the_block_threshold_stay_partial() -> None:
+    # The counterpart: failures the breaker never tripped on are still just
+    # blockers. Only the hard block upgrades the run to "blocked".
+    repeat = CuaRepeatFailureRail(_mcp_cfg(), advise_after=1, block_after=3)
+    progress = CuaProgressRail(_mcp_cfg())
+    await progress.before_invoke(_invoke_ctx())
+
+    for _ in range(2):
+        ctx = _result_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"}, _FAILURE)
+        await repeat.before_tool_call(ctx)
+        await repeat.after_tool_call(ctx)
+        await progress.after_tool_call(ctx)
+
+    result: dict = {"output": "..."}
+    await progress.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "partial"
