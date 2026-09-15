@@ -59,14 +59,35 @@ CUA_AGENT_FACTORY_NAME = "cua_agent"
 # 200 keeps the window header for orientation and drops the stale body.
 _CUA_OFFLOAD_PREVIEW_CHARS = 200
 
-DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN = (
+# The system prompt is assembled from shared segments plus one perception /
+# acting block per mode. Text mode (the default, cua_screenshot_multimodal
+# off) is a tree-only agent: screenshots reach context as placeholders, so the
+# prompt must say they are never delivered rather than merely optional —
+# live-measured, an "optional" wording doubles include_screenshot=true
+# requests for images the model cannot see. Multimodal mode keeps the
+# screenshot and pixel-estimation guidance.
+_CUA_PROMPT_HEAD_EN = (
     "You are a desktop automation agent that operates the host computer through cua-driver tools. "
     "Plan and decide at this agent level, then observe and act on real application windows. "
     "Perception: start with list_windows (or list_apps) to find the target pid and window_id, then "
-    "call get_window_state(pid, window_id) to get the element tree plus a screenshot. Re-snapshot "
+)
+_CUA_PROMPT_PERCEPTION_TEXT_EN = (
+    "call get_window_state(pid, window_id) to take a snapshot: the element tree. Screenshots are "
+    "never delivered to you in this mode — they arrive as text placeholders — so always pass "
+    "include_screenshot=false, never claim to have seen one, and treat the tree as your only "
+    "evidence. Re-snapshot "
+    "with get_window_state before every element-addressed action: element_index values are only "
+    "valid against the latest snapshot of that window. Bound large trees with max_elements or "
+    "max_depth. "
+)
+_CUA_PROMPT_PERCEPTION_MULTIMODAL_EN = (
+    "call get_window_state(pid, window_id) to take a snapshot: the element tree, plus a screenshot "
+    "only when you asked for one. Re-snapshot "
     "with get_window_state before every element-addressed action: element_index values are only "
     "valid against the latest snapshot of that window. Bound large trees with max_elements or "
     "max_depth, and pass include_screenshot=false when you only need to re-index elements. "
+)
+_CUA_PROMPT_MIDDLE_EN = (
     "Electron and Chromium-based apps build their accessibility tree lazily: the first "
     "get_window_state on such a window can return a single bare Document. That does not mean the "
     "window is empty — snapshot the same window once more and the real tree appears. "
@@ -76,17 +97,34 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN = (
     "before trusting its geometry. "
     "Acting: prefer element_index (with pid and window_id) over raw x,y pixels — element actions "
     "work on backgrounded windows, do not move the user's cursor, and tell you what you are acting "
-    "on. Use x,y only for surfaces that do not appear in the element tree, reading coordinates "
-    "straight off the latest screenshot. Mind the two coordinate spaces: element frames from "
-    "get_window_state are SCREEN-absolute pixels, while click/drag x,y are WINDOW-local pixels in "
-    "the space of that window's screenshot. Never pass a frame's x,y straight into a click — "
+    "on. "
+)
+_CUA_PROMPT_PIXELS_TEXT_EN = (
+    "Use x,y only for surfaces that do not appear in the element tree, deriving coordinates from "
+    "an enclosing element's frame rather than guessing. If a window's tree is still empty or bare "
+    "after the one retry, that surface cannot be operated in this mode: do not guess coordinates. "
+    "Report back that this specific task needs a vision-capable desktop agent for that window, "
+    "naming the window and what you completed before reaching it. "
+)
+_CUA_PROMPT_PIXELS_MULTIMODAL_EN = (
+    "Use x,y only for surfaces that do not appear in the element tree, reading coordinates "
+    "straight off the latest screenshot. "
+)
+_CUA_PROMPT_COORDINATES_EN = (
+    "Mind the two coordinate spaces: element frames from "
+    "get_window_state are SCREEN-absolute pixels, while click/drag x,y are WINDOW-local pixels "
+    "measured from that window's top-left corner. Never pass a frame's x,y straight into a click — "
     "subtract the window origin, or use scope='desktop' with screen coordinates. Addressing by "
     "element_index avoids the conversion entirely. "
+)
+_CUA_PROMPT_EDGES_MULTIMODAL_EN = (
     "When you act by x,y coordinates read off a screenshot, treat the target region's edges as "
     "unreliable: your visual estimate of a boundary can be off by tens of pixels, and input that "
     "starts outside the real region usually fails silently. Start clicks and drags well inside "
     "the region (30+ px from every estimated edge), and read a silent no-effect result as a "
     "likely aim miss. "
+)
+_CUA_PROMPT_TAIL_EN = (
     "Keep the default delivery_mode 'background' so the user's "
     "focus is never stolen; escalate a single action to 'foreground' only after a background "
     "attempt verifiably failed. Do not pass 'foreground' preemptively because a target looks like "
@@ -98,7 +136,9 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN = (
     "packaged apps (UWP/WinUI -- Calculator, Settings) and some Chromium, Java, and Qt "
     "surfaces silently discard posted background input, so repeating it cannot succeed. "
     "Verification: input actions are not self-verifying. After clicks, keys, or typed text, "
-    "confirm the effect with a fresh get_window_state screenshot before claiming progress. "
+    "confirm the effect with a fresh snapshot and read the tree before claiming progress. "
+    "Verification snapshots must be unfiltered: do not pass query on them, since a filter can hide "
+    "the very evidence you are checking for. "
     "Prefer launch_app to start applications (it does not steal focus); use kill_app only after "
     "the cooperative close path failed, since unsaved state is lost. "
     "Browser tasks are not yours: web page automation belongs to the browser agent — report back "
@@ -111,13 +151,42 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN = (
     "actually evidenced on screen."
 )
 
-DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN = (
+DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN = (
+    _CUA_PROMPT_HEAD_EN
+    + _CUA_PROMPT_PERCEPTION_TEXT_EN
+    + _CUA_PROMPT_MIDDLE_EN
+    + _CUA_PROMPT_PIXELS_TEXT_EN
+    + _CUA_PROMPT_COORDINATES_EN
+    + _CUA_PROMPT_TAIL_EN
+)
+DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT_EN = (
+    _CUA_PROMPT_HEAD_EN
+    + _CUA_PROMPT_PERCEPTION_MULTIMODAL_EN
+    + _CUA_PROMPT_MIDDLE_EN
+    + _CUA_PROMPT_PIXELS_MULTIMODAL_EN
+    + _CUA_PROMPT_COORDINATES_EN
+    + _CUA_PROMPT_EDGES_MULTIMODAL_EN
+    + _CUA_PROMPT_TAIL_EN
+)
+
+_CUA_PROMPT_HEAD_CN = (
     "你是桌面自动化代理，通过 cua-driver 工具操作本机计算机。"
     "请在当前代理层面规划和决策，然后基于真实应用窗口进行观察和操作。"
     "感知：先用 list_windows（或 list_apps）找到目标 pid 和 window_id，"
-    "再调用 get_window_state(pid, window_id) 获取元素树和截图。"
+)
+_CUA_PROMPT_PERCEPTION_TEXT_CN = (
+    "再调用 get_window_state(pid, window_id) 获取快照：元素树。"
+    "在此模式下截图永远不会交付给你——它们只会以文本占位符出现——"
+    "所以始终传 include_screenshot=false，绝不要声称看到过截图，元素树是你唯一的证据。"
+    "每次基于元素的操作前都要重新调用 get_window_state：element_index 只对该窗口最新一次快照有效。"
+    "元素树过大时用 max_elements 或 max_depth 限制。"
+)
+_CUA_PROMPT_PERCEPTION_MULTIMODAL_CN = (
+    "再调用 get_window_state(pid, window_id) 获取快照：元素树，以及仅在你明确要求时才返回的截图。"
     "每次基于元素的操作前都要重新调用 get_window_state：element_index 只对该窗口最新一次快照有效。"
     "元素树过大时用 max_elements 或 max_depth 限制；只需重建索引时传 include_screenshot=false。"
+)
+_CUA_PROMPT_MIDDLE_CN = (
     "Electron 和基于 Chromium 的应用采用惰性构建无障碍树：对这类窗口首次调用 get_window_state "
     "可能只返回一个空的 Document。这不代表窗口是空的——对同一窗口再快照一次，真正的元素树就会出现。"
     "frame 为 null 的元素并未在屏幕上布局（通常是滚动列表虚拟化的结果）；"
@@ -126,15 +195,26 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN = (
     "在信任其几何信息前先调用 bring_to_front。"
     "操作：优先使用 element_index（配合 pid 和 window_id），而不是原始 x,y 像素坐标——"
     "元素级操作可作用于后台窗口、不会移动用户光标，并能明确操作对象。"
-    "只有目标不在元素树中时才使用 x,y，坐标直接从最新截图上读取。"
+)
+_CUA_PROMPT_PIXELS_TEXT_CN = (
+    "只有目标不在元素树中时才使用 x,y，坐标应由包含它的元素 frame 推算，而不是猜测。"
+    "如果某个窗口的元素树在重试一次后仍然为空或只有一个空根节点，该界面在此模式下无法操作：不要猜测坐标。"
+    "请如实汇报：这个任务需要具备视觉能力的桌面代理来处理该窗口，并说明是哪个窗口以及在此之前已完成的步骤。"
+)
+_CUA_PROMPT_PIXELS_MULTIMODAL_CN = "只有目标不在元素树中时才使用 x,y，坐标直接从最新截图上读取。"
+_CUA_PROMPT_COORDINATES_CN = (
     "注意两套坐标系：get_window_state 返回的元素 frame 是屏幕绝对像素，"
-    "而 click/drag 的 x,y 是该窗口截图空间内的窗口相对像素。"
+    "而 click/drag 的 x,y 是从该窗口左上角起算的窗口相对像素。"
     "绝不要把 frame 的 x,y 直接传给 click——应减去窗口原点，或使用 scope='desktop' 配合屏幕坐标。"
     "使用 element_index 寻址则完全无需换算。"
+)
+_CUA_PROMPT_EDGES_MULTIMODAL_CN = (
     "通过截图读取 x,y 坐标操作时，把目标区域的边缘当作不可靠信息：你对边界的视觉估计"
     "可能偏差数十像素，而起点落在真实区域之外的输入通常会静默失效。"
     "点击和拖拽的起点应落在区域内部足够深处（离每条估计边缘至少 30 像素）；"
     "操作后毫无效果时，优先怀疑是瞄准偏差。"
+)
+_CUA_PROMPT_TAIL_CN = (
     "保持默认 delivery_mode 'background'，绝不抢占用户焦点；"
     "只有后台尝试确认失败后，才对单个操作升级为 'foreground'。"
     "不要因为目标看起来像 canvas 或 Chromium 界面就预先传 'foreground'——"
@@ -144,7 +224,8 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN = (
     "UWP/WinUI 等现代打包应用（如计算器、设置）以及部分 Chromium、Java、Qt 界面"
     "会静默丢弃后台投递的输入，重复后台尝试不可能成功。"
     "验证：输入类操作不会自我验证。点击、按键或输入文本后，"
-    "必须用新的 get_window_state 截图确认效果，然后才能声明进展。"
+    "必须重新快照并读取元素树确认效果，然后才能声明进展。"
+    "用于验证的快照不得过滤：不要传 query，过滤可能恰好隐藏你要确认的证据。"
     "启动应用优先使用 launch_app（不抢焦点）；kill_app 只在协作式关闭失败后使用，因为未保存状态会丢失。"
     "浏览器任务不属于你：网页自动化由浏览器代理负责——遇到此类任务应如实汇报，"
     "而不是通过桌面输入去驱动浏览器。这里指的是真正的浏览器，例如 Chrome、Edge、Firefox。"
@@ -154,10 +235,40 @@ DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN = (
     "避免重复动作；只有屏幕上有具体证据证明任务完成时，才声明完成。"
 )
 
+DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN = (
+    _CUA_PROMPT_HEAD_CN
+    + _CUA_PROMPT_PERCEPTION_TEXT_CN
+    + _CUA_PROMPT_MIDDLE_CN
+    + _CUA_PROMPT_PIXELS_TEXT_CN
+    + _CUA_PROMPT_COORDINATES_CN
+    + _CUA_PROMPT_TAIL_CN
+)
+DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT_CN = (
+    _CUA_PROMPT_HEAD_CN
+    + _CUA_PROMPT_PERCEPTION_MULTIMODAL_CN
+    + _CUA_PROMPT_MIDDLE_CN
+    + _CUA_PROMPT_PIXELS_MULTIMODAL_CN
+    + _CUA_PROMPT_COORDINATES_CN
+    + _CUA_PROMPT_EDGES_MULTIMODAL_CN
+    + _CUA_PROMPT_TAIL_CN
+)
+
+# Text mode (the default): tree-only perception.
 DEFAULT_CUA_AGENT_SYSTEM_PROMPT: Dict[str, str] = {
     "cn": DEFAULT_CUA_AGENT_SYSTEM_PROMPT_CN,
     "en": DEFAULT_CUA_AGENT_SYSTEM_PROMPT_EN,
 }
+# Multimodal mode (cua_screenshot_multimodal=True): screenshot on demand.
+DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT: Dict[str, str] = {
+    "cn": DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT_CN,
+    "en": DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT_EN,
+}
+
+
+def _default_system_prompt(language: str, multimodal: bool) -> str:
+    table = DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT if multimodal else DEFAULT_CUA_AGENT_SYSTEM_PROMPT
+    return table.get(language, table["cn"])
+
 
 # Appended to the system prompt when a delivery mode is pinned. The base prompt
 # teaches the model to manage delivery_mode itself (keep background, escalate
@@ -286,11 +397,7 @@ def build_cua_agent_config(
                 DEFAULT_CUA_AGENT_DESCRIPTION["cn"],
             ),
         ),
-        system_prompt=system_prompt
-        or DEFAULT_CUA_AGENT_SYSTEM_PROMPT.get(
-            resolved_language,
-            DEFAULT_CUA_AGENT_SYSTEM_PROMPT["cn"],
-        ),
+        system_prompt=system_prompt or _default_system_prompt(resolved_language, cua_screenshot_multimodal),
         tools=list(tools or []),
         mcps=list(mcps or []),
         model=model,
@@ -362,7 +469,9 @@ def create_cua_agent(
     ``cua_screenshot_multimodal`` attaches cua-driver screenshots to context as
     image input (requires a vision-capable ``model``). Off by default: the
     agent then perceives through element trees and structured content only,
-    with screenshots reduced to text placeholders.
+    with screenshots reduced to text placeholders. The flag also selects the
+    default system prompt: text mode tells the model screenshots are never
+    delivered; multimodal mode keeps the screenshot and pixel guidance.
 
     ``cua_pause_on_user_input`` installs :class:`CuaUserTakeoverRail`: desktop
     actions are held while the user is using the machine (mouse/keyboard input
@@ -399,10 +508,7 @@ def create_cua_agent(
             DEFAULT_CUA_AGENT_DESCRIPTION["cn"],
         ),
     )
-    final_prompt = system_prompt or DEFAULT_CUA_AGENT_SYSTEM_PROMPT.get(
-        resolved_language,
-        DEFAULT_CUA_AGENT_SYSTEM_PROMPT["cn"],
-    )
+    final_prompt = system_prompt or _default_system_prompt(resolved_language, cua_screenshot_multimodal)
     # Appended even to a caller-supplied prompt: the rail enforces the pin
     # regardless of prompt, so the prompt must not teach the opposite. This is
     # also the only place the build_cua_agent_config path (which carries the

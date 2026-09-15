@@ -21,6 +21,7 @@ from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.subagents.cua_agent import (
     CUA_AGENT_FACTORY_NAME,
     CUA_DELIVERY_MODE_PROMPT_SUFFIX,
+    DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT,
     DEFAULT_CUA_AGENT_SYSTEM_PROMPT,
     build_cua_agent_config,
     create_cua_agent,
@@ -382,9 +383,12 @@ def test_prompt_warns_that_region_edges_are_unreliable(language: str, marker: st
     prompt must both demand an inside-the-region margin and teach that a
     silent no-effect result means aim, not delivery.
     """
-    prompt = DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
+    prompt = DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT[language]
     assert marker in prompt
     assert margin_marker in prompt
+    # Text mode reads x,y from element frames, which are exact, so the
+    # visual-estimate margin would only invite guessed pixel actions there.
+    assert margin_marker not in DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
 
 
 @pytest.mark.parametrize(("language", "marker"), [("en", "preemptively"), ("cn", "预先")])
@@ -412,6 +416,45 @@ def test_driver_contract_rails_are_installed_unconditionally() -> None:
     assert any(isinstance(r, CuaRepeatFailureRail) for r in agent._pending_rails)
     assert any(isinstance(r, CuaSnapshotFreshnessRail) for r in agent._pending_rails)
     assert any(isinstance(r, CuaSnapshotDedupRail) for r in agent._pending_rails)
+
+
+@pytest.mark.parametrize(
+    ("language", "marker"),
+    [("en", "never delivered to you"), ("cn", "永远不会交付给你")],
+)
+def test_text_mode_prompt_says_screenshots_are_never_delivered(language: str, marker: str) -> None:
+    """In text mode the MCP bridge replaces screenshots with placeholders.
+
+    A prompt that calls the screenshot merely optional invites the model to
+    ask for it: live-measured, that wording doubled include_screenshot=true
+    snapshots on images the model could not see. The text-mode prompt must
+    state the screenshot never arrives and that the tree is the only evidence,
+    so the model neither requests nor claims to have seen one.
+    """
+    text_prompt = DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
+    assert marker in text_prompt
+    assert "include_screenshot=false" in text_prompt
+    assert marker not in DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT[language]
+
+
+@pytest.mark.parametrize("language", ["en", "cn"])
+def test_multimodal_flag_selects_the_vision_prompt(language: str) -> None:
+    """The flag that attaches images must also switch what the model is told.
+
+    Otherwise multimodal runs are instructed that screenshots never arrive
+    while images sit in context, and text runs get pixel-reading guidance for
+    images they cannot see. Both factories must agree, since the config path
+    bakes the prompt into the SubAgentConfig before create_cua_agent runs.
+    """
+    text_agent = create_cua_agent(_create_dummy_model(), language=language)
+    vision_agent = create_cua_agent(_create_dummy_model(), language=language, cua_screenshot_multimodal=True)
+    assert text_agent.deep_config.system_prompt == DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
+    assert vision_agent.deep_config.system_prompt == DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT[language]
+
+    text_spec = build_cua_agent_config(_create_dummy_model(), language=language)
+    vision_spec = build_cua_agent_config(_create_dummy_model(), language=language, cua_screenshot_multimodal=True)
+    assert text_spec.system_prompt == DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
+    assert vision_spec.system_prompt == DEFAULT_CUA_AGENT_MULTIMODAL_SYSTEM_PROMPT[language]
 
 
 def test_user_takeover_pause_is_off_by_default_and_can_be_enabled() -> None:
