@@ -83,6 +83,9 @@ def resolve_subagent_task_timeout_s() -> float:
 
 
 _BROWSER_QUERY_STATE_KEY = "__browser_query_delegation_state__"
+# Last resume_context per cua sub-session, keyed by resume_task_id, so a
+# resumed delegation can carry the retained desktop context into its query.
+_CUA_DELEGATION_STATE_KEY = "__cua_delegation_state__"
 _BROWSER_SIMPLE_QUERY_BUDGET_S = 240.0
 _BROWSER_COMPLEX_QUERY_BUDGET_S = 600.0
 _BROWSER_QUERY_RESUME_LIMIT = 1
@@ -396,6 +399,59 @@ class TaskTool(Tool):
             f"Recovery hint: {recovery or 'collect_missing_evidence_from_current_page'}. "
             "Do not repeat satisfied fields, restart navigation, or expand the task scope."
         )
+
+    @staticmethod
+    def _save_cua_resume_context(
+        parent_session: Session,
+        sub_session_id: str,
+        resume_context: dict[str, Any],
+    ) -> None:
+        records = parent_session.get_state(_CUA_DELEGATION_STATE_KEY)
+        records = dict(records) if isinstance(records, dict) else {}
+        records[str(sub_session_id)] = dict(resume_context)
+        parent_session.update_state({_CUA_DELEGATION_STATE_KEY: records})
+
+    @staticmethod
+    def _focused_cua_resume_task(
+        parent_session: Session,
+        resume_task_id: str,
+        task_description: Any,
+    ) -> Any:
+        """Prefix a cua resume with the context its last run reported.
+
+        browser_agent narrows a resume to its unresolved evidence slots; a
+        desktop run has no slot model, so the retained context is the last
+        reported window, blockers and recovery hint, with the parent's own
+        (already narrowed) description as the remaining work. A run that was
+        cancelled on the delegation budget additionally has to re-verify the
+        desktop: the action in flight at cancellation may have executed
+        without being recorded. Without a stored record the description
+        passes through unchanged.
+        """
+        records = parent_session.get_state(_CUA_DELEGATION_STATE_KEY)
+        record = records.get(str(resume_task_id)) if isinstance(records, dict) else None
+        if not isinstance(record, dict):
+            return task_description
+        lines = [
+            "Resume the same desktop task from its current window and retained progress; do not restart from scratch.",
+            f"Previous run status: {record.get('status') or 'unknown'}.",
+        ]
+        if record.get("current_window"):
+            lines.append(f"Last window: {json.dumps(record['current_window'], ensure_ascii=False)}.")
+        if record.get("blockers"):
+            lines.append(f"Reported blockers: {json.dumps(record['blockers'], ensure_ascii=False)}.")
+        if record.get("recommended_recovery"):
+            lines.append(f"Recovery hint: {record['recommended_recovery']}")
+        if record.get("status") == "timeout":
+            lines.append(
+                "The previous run was cut off mid-run: its last desktop action may have executed "
+                "without being recorded. Re-snapshot the current window and verify whether that "
+                "action already took effect before repeating it."
+            )
+        else:
+            lines.append("Re-snapshot the current window with get_window_state before acting.")
+        lines.append(f"Remaining task: {task_description}")
+        return "\n".join(lines)
 
     @classmethod
     def _existing_browser_query_output(
@@ -778,6 +834,8 @@ class TaskTool(Tool):
             subagent_type=normalized_type,
             sub_session_id=sub_session_id,
         )
+        if normalized_type == "cua_agent" and isinstance(data.get("resume_context"), dict):
+            self._save_cua_resume_context(parent_session, sub_session_id, data["resume_context"])
         if browser_query is None:
             return ToolOutput(success=True, data=data, error=None)
         browser_result = data.get("browser_result")
@@ -832,10 +890,12 @@ class TaskTool(Tool):
         budget_s: float,
     ) -> ToolOutput:
         message = (
-            f"cua_agent ran out of its {budget_s:.0f}s delegation budget before reporting. "
-            "Its desktop session and progress are preserved. To continue, call task_tool "
-            "again with subagent_type='cua_agent', the same resume_task_id, and a "
-            "task_description covering only what is still missing."
+            f"cua_agent ran out of its {budget_s:.0f}s delegation budget and was cancelled "
+            "mid-run. Its desktop session and the steps it recorded are preserved, but the "
+            "action in flight at cancellation may have executed without being recorded. To "
+            "continue, call task_tool again with subagent_type='cua_agent', the same "
+            "resume_task_id, and a task_description covering only what is still missing; the "
+            "resumed run re-verifies the desktop before acting."
         )
         data = {
             "output": message,
@@ -845,7 +905,14 @@ class TaskTool(Tool):
             "retryable": True,
             "resume_context": {
                 "status": "timeout",
-                "recommended_recovery": ("Resume with the same resume_task_id; do not restart from scratch."),
+                # No driver-side ack exists for a cancelled call (get_session_state
+                # carries no last-action record), so the resumed run must verify.
+                "last_action_confirmed": False,
+                "recommended_recovery": (
+                    "Resume with the same resume_task_id; do not restart from scratch. "
+                    "Re-snapshot and verify whether the interrupted action took effect "
+                    "before repeating it."
+                ),
             },
         }
         return ToolOutput(success=True, data=data, error=None)
@@ -946,11 +1013,17 @@ class TaskTool(Tool):
                             budget_s,
                             sub_session_id,
                         )
-                        return self._build_cua_timeout_output(
+                        timeout_output = self._build_cua_timeout_output(
                             subagent,
                             sub_session_id=sub_session_id,
                             budget_s=budget_s,
                         )
+                        self._save_cua_resume_context(
+                            parent_session,
+                            sub_session_id,
+                            timeout_output.data["resume_context"],
+                        )
+                        return timeout_output
                 else:
                     result = await self._invoke_with_usage_delegation(
                         subagent,
@@ -1042,6 +1115,8 @@ class TaskTool(Tool):
                 return browser_query.early_output
             task_description = browser_query.task_description
             resume_task_id = browser_query.resume_task_id
+        elif normalized_type == "cua_agent" and resume_task_id:
+            task_description = self._focused_cua_resume_task(parent_session, resume_task_id, task_description)
 
         try:
             sub_session_id = self._build_sub_session_id(
