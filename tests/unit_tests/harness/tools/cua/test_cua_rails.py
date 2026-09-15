@@ -1493,9 +1493,7 @@ async def test_snapshot_and_freshness_neutral_responses_are_never_blockers() -> 
     await rail.before_invoke(_invoke_ctx())
 
     await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
-    await rail.after_tool_call(
-        _result_ctx("mcp_cua-driver_list_windows", {}, "pid=1 title=Notepad")
-    )
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_list_windows", {}, "pid=1 title=Notepad"))
 
     result: dict = {"output": "..."}
     await rail.after_invoke(_after_invoke_ctx(result))

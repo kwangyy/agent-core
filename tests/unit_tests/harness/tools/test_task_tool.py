@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-import re
 
 from openjiuwen.core.foundation.llm import Model, ModelClientConfig, ModelRequestConfig
-from openjiuwen.core.foundation.tool import ToolCard, McpServerConfig
+from openjiuwen.core.foundation.tool import McpServerConfig, ToolCard
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.session.agent import Session
 from openjiuwen.core.single_agent.ability_manager import AbilityManager
@@ -96,7 +96,7 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(result.data, {"output": "done", 'agent_id': 'test_id'})
+        self.assertEqual(result.data, {"output": "done", "agent_id": "test_id"})
         self.assertIsNone(result.error)
         self.assertEqual(called_inputs["query"], "run task")
         self.assertEqual(prepare_calls, 1)
@@ -201,7 +201,10 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
         )
         for subagent in (InvokeOnlySubAgent(), StreamingSubAgent()):
             result = await tool._invoke_subagent(
-                subagent, inputs, parent_session_id="parent_session", session=child_session,
+                subagent,
+                inputs,
+                parent_session_id="parent_session",
+                session=child_session,
             )
             self.assertEqual(result["output"], "done")
 
@@ -538,9 +541,7 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
             "status": "partial",
             "retryable": True,
             "missing_fields": ["product_rating"],
-            "missing_slots": [
-                {"entity": "product", "variant": "default", "field": "product_rating"}
-            ],
+            "missing_slots": [{"entity": "product", "variant": "default", "field": "product_rating"}],
             "blockers": [],
             "evidence": [{"field": "title", "value": "Keyboard"}],
             "current_page": {"url": "https://example.test/item/1"},
@@ -628,9 +629,7 @@ class TestTaskTool(unittest.IsolatedAsyncioTestCase):
             "status": "partial",
             "retryable": True,
             "missing_fields": ["product_rating"],
-            "missing_slots": [
-                {"entity": "product", "variant": "default", "field": "product_rating"}
-            ],
+            "missing_slots": [{"entity": "product", "variant": "default", "field": "product_rating"}],
             "blockers": [],
             "evidence": [{"field": "title", "value": "Keyboard"}],
             "recommended_recovery": "read_product_rating_on_current_page",
@@ -925,9 +924,7 @@ class TestTaskToolSync(unittest.TestCase):
                 description="custom general subagent",
             ),
             system_prompt="custom prompt",
-            tools=[
-                ToolCard(id="custom_tool", name="custom_tool", description="custom tool")
-            ],
+            tools=[ToolCard(id="custom_tool", name="custom_tool", description="custom tool")],
             mcps=[
                 McpServerConfig(
                     server_name="custom_mcp",

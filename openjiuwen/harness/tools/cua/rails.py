@@ -501,14 +501,10 @@ class CuaUserTakeoverRail(AgentRail):
         if idle is None or idle >= self._active_within_s:
             self._mark_own_input_dispatch(tool_name)
             return
-        logger.warning(
-            "[CuaUserTakeoverRail] user is using the desktop (idle %.1fs); holding %s", idle, tool_name
-        )
+        logger.warning("[CuaUserTakeoverRail] user is using the desktop (idle %.1fs); holding %s", idle, tool_name)
         while True:
             if waited >= self._max_wait_s:
-                logger.warning(
-                    "[CuaUserTakeoverRail] user still active after %.0fs; rejecting %s", waited, tool_name
-                )
+                logger.warning("[CuaUserTakeoverRail] user still active after %.0fs; rejecting %s", waited, tool_name)
                 self._reject_tool(ctx, inputs, _USER_TAKEOVER_BLOCKED.format(waited=waited))
                 return
             await self._sleep(self._poll_interval_s)
@@ -517,9 +513,7 @@ class CuaUserTakeoverRail(AgentRail):
             if idle is None or idle >= self._resume_after_idle_s:
                 break
         logger.info("[CuaUserTakeoverRail] desktop idle again after %.1fs; releasing %s", waited, tool_name)
-        self._pending_note = _USER_TAKEOVER_RESUMED_NOTE.format(
-            waited=waited, idle=self._resume_after_idle_s
-        )
+        self._pending_note = _USER_TAKEOVER_RESUMED_NOTE.format(waited=waited, idle=self._resume_after_idle_s)
         self._mark_own_input_dispatch(tool_name)
 
     def _mark_own_input_dispatch(self, tool_name: str) -> None:

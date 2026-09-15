@@ -74,10 +74,14 @@ def resolve_subagent_task_timeout_s() -> float:
     if value <= 0:
         logger.warning(
             "[TaskTool] ignoring %s=%r (need a positive number of seconds); using %ss",
-            SUBAGENT_TASK_TIMEOUT_ENV, raw, DEFAULT_SUBAGENT_TASK_TIMEOUT_S,
+            SUBAGENT_TASK_TIMEOUT_ENV,
+            raw,
+            DEFAULT_SUBAGENT_TASK_TIMEOUT_S,
         )
         return DEFAULT_SUBAGENT_TASK_TIMEOUT_S
     return value
+
+
 _BROWSER_QUERY_STATE_KEY = "__browser_query_delegation_state__"
 _BROWSER_SIMPLE_QUERY_BUDGET_S = 240.0
 _BROWSER_COMPLEX_QUERY_BUDGET_S = 600.0
@@ -96,9 +100,7 @@ def _summarize_task_description(task_description: Any) -> dict[str, Any]:
     task_text = str(task_description or "")
     task_hash = ""
     if task_text:
-        task_hash = hashlib.sha256(
-            task_text.encode("utf-8", errors="ignore")
-        ).hexdigest()[:12]
+        task_hash = hashlib.sha256(task_text.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     return {
         "redacted": True,
@@ -220,11 +222,7 @@ class TaskTool(Tool):
         self._allowed_subagent_types = (
             None
             if allowed_subagent_types is None
-            else frozenset(
-                str(name).strip()
-                for name in allowed_subagent_types
-                if str(name).strip()
-            )
+            else frozenset(str(name).strip() for name in allowed_subagent_types if str(name).strip())
         )
 
     @staticmethod
@@ -237,9 +235,8 @@ class TaskTool(Tool):
         normalized_resume_id = str(resume_task_id or "").strip()
         if normalized_resume_id:
             expected_prefix = f"{parent_session_id}_sub_{normalized_type}_"
-            if (
-                normalized_type not in _EXPLICIT_RESUME_SUBAGENT_TYPES
-                or not normalized_resume_id.startswith(expected_prefix)
+            if normalized_type not in _EXPLICIT_RESUME_SUBAGENT_TYPES or not normalized_resume_id.startswith(
+                expected_prefix
             ):
                 raise ValueError("resume_task_id is not valid for this parent task")
             return normalized_resume_id
@@ -356,11 +353,7 @@ class TaskTool(Tool):
         records = parent_session.get_state(_BROWSER_QUERY_STATE_KEY)
         if not isinstance(records, dict):
             return {}
-        return {
-            str(key): dict(value)
-            for key, value in records.items()
-            if isinstance(value, dict)
-        }
+        return {str(key): dict(value) for key, value in records.items() if isinstance(value, dict)}
 
     @staticmethod
     def _save_browser_query_records(
@@ -387,11 +380,9 @@ class TaskTool(Tool):
     def _focused_browser_resume_task(record: dict[str, Any]) -> str:
         browser_result = record.get("browser_result")
         browser_result = browser_result if isinstance(browser_result, dict) else {}
-        missing_slots = [
-            dict(slot)
-            for slot in browser_result.get("missing_slots") or []
-            if isinstance(slot, dict)
-        ][:12]
+        missing_slots = [dict(slot) for slot in browser_result.get("missing_slots") or [] if isinstance(slot, dict)][
+            :12
+        ]
         if not missing_slots:
             missing_slots = [
                 {"field": str(field_name)}
@@ -465,19 +456,13 @@ class TaskTool(Tool):
         if self._allowed_subagent_types is not None and normalized_type not in self._allowed_subagent_types:
             raise build_error(
                 StatusCode.TOOL_TASK_TOOL_INVOKED,
-                reason=(
-                    f"Subagent type '{normalized_type}' is not available through "
-                    "task_tool"
-                ),
+                reason=(f"Subagent type '{normalized_type}' is not available through task_tool"),
             )
         if normalized_type != "browser_agent":
             if resume_task_id and normalized_type not in _EXPLICIT_RESUME_SUBAGENT_TYPES:
                 raise build_error(
                     StatusCode.TOOL_TASK_TOOL_INVOKED,
-                    reason=(
-                        "'resume_task_id' is supported only for "
-                        f"{sorted(_EXPLICIT_RESUME_SUBAGENT_TYPES)}"
-                    ),
+                    reason=(f"'resume_task_id' is supported only for {sorted(_EXPLICIT_RESUME_SUBAGENT_TYPES)}"),
                 )
             return normalized_type, task_description, resume_task_id, None
 
@@ -860,9 +845,7 @@ class TaskTool(Tool):
             "retryable": True,
             "resume_context": {
                 "status": "timeout",
-                "recommended_recovery": (
-                    "Resume with the same resume_task_id; do not restart from scratch."
-                ),
+                "recommended_recovery": ("Resume with the same resume_task_id; do not restart from scratch."),
             },
         }
         return ToolOutput(success=True, data=data, error=None)
@@ -887,10 +870,7 @@ class TaskTool(Tool):
         parent_subject_id = parent_subject.subject_id if parent_subject else "main"
         subject = ExecutionSubject(
             subject_id=f"subagent:{uuid.uuid4().hex}",
-            display_name=str(
-                getattr(getattr(subagent, "card", None), "name", None)
-                or normalized_type
-            ),
+            display_name=str(getattr(getattr(subagent, "card", None), "name", None) or normalized_type),
             kind="subagent",
             parent_subject_id=parent_subject_id,
             session_id=sub_session_id,
@@ -963,7 +943,8 @@ class TaskTool(Tool):
                         logger.warning(
                             "[TaskTool] cua_agent delegation exceeded %.0fs; returning resumable "
                             "result for sub_session=%s",
-                            budget_s, sub_session_id,
+                            budget_s,
+                            sub_session_id,
                         )
                         return self._build_cua_timeout_output(
                             subagent,
@@ -1001,9 +982,7 @@ class TaskTool(Tool):
                     browser_query,
                     "browser_subagent_execution_failed",
                 )
-                logger.error(
-                    f"[TaskTool] Subagent: {normalized_type} execution failed, error={exc}"
-                )
+                logger.error(f"[TaskTool] Subagent: {normalized_type} execution failed, error={exc}")
                 raise build_error(
                     StatusCode.TOOL_TASK_TOOL_INVOKED,
                     reason=f"Subagent {normalized_type} execution failed: {exc}",
@@ -1045,16 +1024,12 @@ class TaskTool(Tool):
                 reason="TaskTool requires a valid session in kwargs",
             )
 
-        normalized_type, task_description, resume_task_id, browser_capabilities = (
-            self._parse_invocation_inputs(inputs)
-        )
+        normalized_type, task_description, resume_task_id, browser_capabilities = self._parse_invocation_inputs(inputs)
         runtime_parent_session_id = parent_session.get_session_id()
         affinity_enabled = kv_cache_subagent_lifecycle.affinity_enabled(self.parent_agent)
         parent_cache_id = runtime_parent_session_id
         if affinity_enabled:
-            parent_cache_id = kv_cache_subagent_lifecycle.resolve_subagent_parent_cache_id(
-                parent_session
-            )
+            parent_cache_id = kv_cache_subagent_lifecycle.resolve_subagent_parent_cache_id(parent_session)
         browser_query: _BrowserQueryContext | None = None
         if normalized_type == "browser_agent":
             browser_query = self._prepare_browser_query(
@@ -1097,10 +1072,7 @@ class TaskTool(Tool):
         )
 
         query_summary = _summarize_task_description(task_description)
-        invoke_log = (
-            "[TaskTool] Invoking subagent with isolated session: %s, "
-            "subagent_type=%s, query_summary=%s"
-        )
+        invoke_log = "[TaskTool] Invoking subagent with isolated session: %s, subagent_type=%s, query_summary=%s"
         if normalized_type == "browser_agent" and browser_agent_log_info is not None:
             browser_agent_log_info(invoke_log, sub_session_id, normalized_type, query_summary)
         else:
