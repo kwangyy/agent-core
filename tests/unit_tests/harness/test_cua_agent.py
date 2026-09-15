@@ -414,20 +414,21 @@ def test_driver_contract_rails_are_installed_unconditionally() -> None:
     assert any(isinstance(r, CuaSnapshotDedupRail) for r in agent._pending_rails)
 
 
-def test_user_takeover_pause_is_on_by_default_and_can_be_disabled() -> None:
-    """A desktop agent that keeps clicking while the user is at the keyboard
-    is worse than one that waits, so the pause is opt-out."""
+def test_user_takeover_pause_is_off_by_default_and_can_be_enabled() -> None:
+    """The pause is opt-in for now: holding every action while the user
+    touches the machine made interactive runs stall, so the rail stays
+    available but is not installed unless asked for."""
     agent = create_cua_agent(_create_dummy_model(), language="en")
-    assert any(isinstance(r, CuaUserTakeoverRail) for r in agent._pending_rails)
-
-    agent = create_cua_agent(_create_dummy_model(), language="en", cua_pause_on_user_input=False)
     assert not any(isinstance(r, CuaUserTakeoverRail) for r in agent._pending_rails)
+
+    agent = create_cua_agent(_create_dummy_model(), language="en", cua_pause_on_user_input=True)
+    assert any(isinstance(r, CuaUserTakeoverRail) for r in agent._pending_rails)
 
 
 def test_build_cua_agent_config_forwards_pause_on_user_input() -> None:
-    spec = build_cua_agent_config(_create_dummy_model(), cua_pause_on_user_input=False)
-    assert spec.factory_kwargs["cua_pause_on_user_input"] is False
-    assert build_cua_agent_config(_create_dummy_model()).factory_kwargs["cua_pause_on_user_input"] is True
+    spec = build_cua_agent_config(_create_dummy_model(), cua_pause_on_user_input=True)
+    assert spec.factory_kwargs["cua_pause_on_user_input"] is True
+    assert build_cua_agent_config(_create_dummy_model()).factory_kwargs["cua_pause_on_user_input"] is False
 
 
 def test_superseded_snapshots_keep_only_a_short_inline_preview() -> None:

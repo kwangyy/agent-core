@@ -260,7 +260,7 @@ def build_cua_agent_config(
     cua_delivery_mode: Optional[Literal["background", "foreground"]] = None,
     cua_screenshot_multimodal: bool = False,
     cua_snapshot_keep_last_k: int = 3,
-    cua_pause_on_user_input: bool = True,
+    cua_pause_on_user_input: bool = False,
     permissions: Optional[dict] = None,
     permission_host: Optional[Any] = None,
 ) -> SubAgentConfig:
@@ -341,7 +341,7 @@ def create_cua_agent(
     cua_delivery_mode: Optional[Literal["background", "foreground"]] = None,
     cua_screenshot_multimodal: bool = False,
     cua_snapshot_keep_last_k: int = 3,
-    cua_pause_on_user_input: bool = True,
+    cua_pause_on_user_input: bool = False,
     **config_kwargs: Any,
 ) -> DeepAgent:
     """Create the cua desktop subagent with a task-scoped tool allowlist.
@@ -367,8 +367,9 @@ def create_cua_agent(
     ``cua_pause_on_user_input`` installs :class:`CuaUserTakeoverRail`: desktop
     actions are held while the user is using the machine (mouse/keyboard input
     seen by the OS) and released once it has been idle again; a takeover that
-    outlasts the rail's wait budget ends the delegation with a report. On by
-    default; inert on hosts without a user-activity probe.
+    outlasts the rail's wait budget ends the delegation with a report. Off by
+    default for now (opt in per agent); inert on hosts without a user-activity
+    probe.
 
     ``cua_snapshot_keep_last_k`` is how many recent desktop snapshots stay in
     context: it drives both the tool-result window on the snapshot tools and,
