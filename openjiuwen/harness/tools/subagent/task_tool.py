@@ -886,6 +886,7 @@ class TaskTool(Tool):
     def _build_cua_timeout_output(
         subagent: Any,
         *,
+        parent_session: Session,
         sub_session_id: str,
         budget_s: float,
     ) -> ToolOutput:
@@ -897,23 +898,25 @@ class TaskTool(Tool):
             "resume_task_id, and a task_description covering only what is still missing; the "
             "resumed run re-verifies the desktop before acting."
         )
+        resume_context = {
+            "status": "timeout",
+            # No driver-side ack exists for a cancelled call (get_session_state
+            # carries no last-action record), so the resumed run must verify.
+            "last_action_confirmed": False,
+            "recommended_recovery": (
+                "Resume with the same resume_task_id; do not restart from scratch. "
+                "Re-snapshot and verify whether the interrupted action took effect "
+                "before repeating it."
+            ),
+        }
+        TaskTool._save_cua_resume_context(parent_session, sub_session_id, resume_context)
         data = {
             "output": message,
             "agent_id": getattr(getattr(subagent, "card", None), "id", None),
             "resume_task_id": sub_session_id,
             "status": "timeout",
             "retryable": True,
-            "resume_context": {
-                "status": "timeout",
-                # No driver-side ack exists for a cancelled call (get_session_state
-                # carries no last-action record), so the resumed run must verify.
-                "last_action_confirmed": False,
-                "recommended_recovery": (
-                    "Resume with the same resume_task_id; do not restart from scratch. "
-                    "Re-snapshot and verify whether the interrupted action took effect "
-                    "before repeating it."
-                ),
-            },
+            "resume_context": resume_context,
         }
         return ToolOutput(success=True, data=data, error=None)
 
@@ -1013,17 +1016,12 @@ class TaskTool(Tool):
                             budget_s,
                             sub_session_id,
                         )
-                        timeout_output = self._build_cua_timeout_output(
+                        return self._build_cua_timeout_output(
                             subagent,
+                            parent_session=parent_session,
                             sub_session_id=sub_session_id,
                             budget_s=budget_s,
                         )
-                        self._save_cua_resume_context(
-                            parent_session,
-                            sub_session_id,
-                            timeout_output.data["resume_context"],
-                        )
-                        return timeout_output
                 else:
                     result = await self._invoke_with_usage_delegation(
                         subagent,
