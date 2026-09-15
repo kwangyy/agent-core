@@ -116,6 +116,17 @@ _STALE_SNAPSHOT_ADVISORY = (
     "again and retry with a fresh element_index before trying anything else."
 )
 
+# Set on ctx.extra by CuaSnapshotFreshnessRail.before_tool_call when it strips
+# `query` from a verification snapshot, so after_tool_call can say so.
+_VERIFY_QUERY_DROPPED_EXTRA_KEY = "_cua_verify_query_dropped"
+
+_FILTERED_VERIFY_SNAPSHOT_NOTE = (
+    "Note: query={query!r} was dropped from this snapshot because it is your first look at this "
+    "window since you acted on it. A verification snapshot must be unfiltered: a filter can hide "
+    "the very evidence you are checking for. Bound size with max_elements or max_depth instead; "
+    "query is fine on later snapshots of an unchanged window."
+)
+
 # Fields the driver regenerates on every snapshot even when nothing changed:
 # screenshot bytes (cursor blink / encoder noise), the monotonic snapshot_id
 # counter, and -- MCP structuredContent only, the CLI payload has no token
@@ -164,6 +175,10 @@ _STATE_REVISIT_ADVISE_AFTER = 3
 _STATE_REVISIT_HISTORY_SIZE = 8
 _CUA_BLOCKER_NOTE_MAX = 200
 _CUA_MAX_TRACKED_BLOCKERS = 5
+# Set on ctx.extra next to ``_skip_tool`` when CuaRepeatFailureRail refuses a
+# call, so CuaProgressRail can tell a hard block from an ordinary rejection.
+_REPEAT_BLOCKED_EXTRA_KEY = "_cua_repeat_blocked"
+
 _CUA_PROGRESS_STATE_KEY = "cua_agent_progress_state"
 
 _STATE_REVISIT_ADVISORY = (
@@ -175,10 +190,6 @@ _STATE_REVISIT_ADVISORY = (
 
 
 class CuaRuntimeRail(AgentRail):
-# Set on ctx.extra next to ``_skip_tool`` when CuaRepeatFailureRail refuses a
-# call, so CuaProgressRail can tell a hard block from an ordinary rejection.
-_REPEAT_BLOCKED_EXTRA_KEY = "_cua_repeat_blocked"
-
     """Lifecycle rail for the cua-driver MCP runtime.
 
     Run-scoped setup, cached after first success: verify the daemon is
@@ -701,6 +712,18 @@ class CuaSnapshotFreshnessRail(AgentRail):
     re-snapshot and re-index. The 70 corpus failures would each have carried
     the hint on their first failure instead of waiting for the repeat-failure
     advisory at three.
+
+    The same dirty-window state drives one rewrite: ``query`` is dropped from
+    the first snapshot after an action on that window. That snapshot is the
+    verification of the action, and a filter can hide the very evidence being
+    checked (bench-observed: a verify filtered to the clicked item's name hid
+    the "1 item selected" status bar, read as failure, and spiralled into a
+    20-step recovery; a verify filtered to "About" needed four more filtered
+    snapshots to find what one unfiltered tree showed). Telling the model in
+    the prompt not to filter verification snapshots did not change its
+    behaviour, so the rail does it and says so in the result. Discovery
+    snapshots -- a window not acted on since its last snapshot -- keep their
+    query.
     """
 
     def __init__(self, mcp_cfg: McpServerConfig) -> None:
@@ -711,6 +734,27 @@ class CuaSnapshotFreshnessRail(AgentRail):
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         self._fresh.clear()
+
+    async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
+        inputs = ctx.inputs
+        if not isinstance(inputs, ToolCallInputs):
+            return
+        tool_name = str(inputs.tool_name or "")
+        if not tool_name.startswith(self._tool_prefix):
+            return
+        if tool_name[len(self._tool_prefix) :] not in _SNAPSHOT_TOOLS:
+            return
+        args, was_json_encoded = _normalize_tool_args(inputs.tool_args)
+        if args is None or not args.get("query"):
+            return
+        key = (args.get("pid"), args.get("window_id"))
+        # Unknown or still-fresh window: a discovery snapshot, filter allowed.
+        if self._fresh.get(key, True):
+            return
+        query = args.pop("query")
+        inputs.tool_args = json.dumps(args) if was_json_encoded else args
+        ctx.extra[_VERIFY_QUERY_DROPPED_EXTRA_KEY] = query
+        logger.info("[CuaSnapshotFreshnessRail] dropped query=%r from a verification %s", query, tool_name)
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
@@ -731,6 +775,9 @@ class CuaSnapshotFreshnessRail(AgentRail):
 
         if short_name in _SNAPSHOT_TOOLS:
             self._fresh[key] = True
+            dropped = ctx.extra.get(_VERIFY_QUERY_DROPPED_EXTRA_KEY)
+            if dropped is not None:
+                _append_advisory(inputs, _FILTERED_VERIFY_SNAPSHOT_NOTE.format(query=dropped))
             return
         if short_name in _FRESHNESS_NEUTRAL_TOOLS:
             return
@@ -994,6 +1041,7 @@ class CuaRepeatFailureRail(AgentRail):
         )
         message = _REPEAT_BLOCKED.format(count=count) + "\n\nThe repeated response was:\n" + response
         self._reject_tool(ctx, inputs, message)
+        ctx.extra[_REPEAT_BLOCKED_EXTRA_KEY] = True
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
@@ -1041,7 +1089,6 @@ class CuaRepeatFailureRail(AgentRail):
     def _reject_tool(ctx: AgentCallbackContext, inputs: ToolCallInputs, error_msg: str) -> None:
         """Hard-block a tool call using the shared rail contract."""
         tool_call = inputs.tool_call
-        ctx.extra[_REPEAT_BLOCKED_EXTRA_KEY] = True
         tool_call_id = tool_call.id if tool_call else ""
         ctx.extra["_skip_tool"] = True
         inputs.tool_result = {"error": error_msg}
@@ -1096,6 +1143,8 @@ class CuaProgressRail(AgentRail):
         self._advised: set = set()
         self._current_window: Optional[dict] = None
         self._blockers: list = []
+        # Short names of calls CuaRepeatFailureRail refused in this run.
+        self._hard_blocked: list = []
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         self._history = {}
@@ -1103,6 +1152,7 @@ class CuaProgressRail(AgentRail):
         self._advised = set()
         self._current_window = None
         self._blockers = []
+        self._hard_blocked = []
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
         inputs = ctx.inputs
@@ -1111,6 +1161,7 @@ class CuaProgressRail(AgentRail):
         tool_name = str(inputs.tool_name or "")
         if not tool_name.startswith(self._tool_prefix):
             return
+        short_name = tool_name[len(self._tool_prefix) :]
         if ctx.extra.get("_skip_tool"):
             # A rail-side rejection never reached the driver. A repeat-failure
             # block is still terminal for the run: the model was thrashing on
@@ -1147,8 +1198,6 @@ class CuaProgressRail(AgentRail):
         inputs: ToolCallInputs,
         short_name: str,
         pid: Any,
-        # Short names of calls CuaRepeatFailureRail refused in this run.
-        self._hard_blocked: list = []
         window_id: Any,
         response: str,
     ) -> None:
@@ -1156,7 +1205,6 @@ class CuaProgressRail(AgentRail):
         comparable = _SNAPSHOT_IMAGE_PLACEHOLDER_RE.sub("[image content: <volatile>]", comparable)
         digest = hashlib.sha256(comparable.encode("utf-8")).hexdigest()
         key = (short_name, pid, window_id)
-        self._hard_blocked = []
         history = self._history.setdefault(key, collections.deque(maxlen=_STATE_REVISIT_HISTORY_SIZE))
 
         if digest not in history:
@@ -1165,7 +1213,6 @@ class CuaProgressRail(AgentRail):
 
         revisit_key = (key, digest)
         count = self._revisit_counts.get(revisit_key, 1) + 1
-        short_name = tool_name[len(self._tool_prefix) :]
         self._revisit_counts[revisit_key] = count
         if count >= _STATE_REVISIT_ADVISE_AFTER and revisit_key not in self._advised:
             self._advised.add(revisit_key)

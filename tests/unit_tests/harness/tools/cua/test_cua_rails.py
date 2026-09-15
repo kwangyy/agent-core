@@ -1077,6 +1077,63 @@ async def test_a_fresh_snapshot_clears_the_stale_state() -> None:
     assert "snapshot taken BEFORE" not in after.inputs.tool_msg.content
 
 
+async def _snapshot_round_trip(rail, args, content: str = "\u2705 tree"):
+    """One snapshot through both hooks, as the runtime drives them."""
+    ctx = _result_ctx("mcp_cua-driver_get_window_state", args, content)
+    await rail.before_tool_call(ctx)
+    await rail.after_tool_call(ctx)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_query_is_dropped_from_the_first_snapshot_after_an_action() -> None:
+    # Bench-observed: a verify snapshot filtered to the clicked file's name hid
+    # the Explorer status bar that proved the selection, the model read the
+    # absence as failure and spiralled for 20 steps. The prompt already says
+    # not to filter verification snapshots and the model ignores it, so the
+    # rail must remove the filter itself and tell the model why.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "\u2705 tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "\u2705 clicked")
+    verify = await _snapshot_round_trip(rail, {**win, "query": "bench_item_07", "max_elements": 200})
+
+    assert "query" not in verify.inputs.tool_args
+    assert verify.inputs.tool_args["max_elements"] == 200, "size bounds must survive; only the filter goes"
+    assert "query='bench_item_07' was dropped" in verify.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_query_is_kept_on_discovery_snapshots() -> None:
+    # A window not acted on since its last snapshot (or never seen) is being
+    # explored, not verified: filtering a 5000-element Chromium tree down to
+    # the control being looked for is exactly what query is for.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    never_seen = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+    still_fresh = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+
+    for ctx in (never_seen, still_fresh):
+        assert ctx.inputs.tool_args["query"] == "Save"
+        assert "was dropped" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_dropped_query_is_written_back_in_the_json_shape_it_arrived_in() -> None:
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "\u2705 tree")
+    await _observe(rail, "type_text", {**win, "element_index": 0, "text": "x"}, "\u2705 typed")
+    verify = await _snapshot_round_trip(rail, json.dumps({**win, "query": "Unmodified"}))
+
+    assert isinstance(verify.inputs.tool_args, str)
+    assert json.loads(verify.inputs.tool_args) == win
+    assert "query='Unmodified' was dropped" in verify.inputs.tool_msg.content
+
+
 @pytest.mark.asyncio
 async def test_an_unsnapshotted_window_counts_as_stale() -> None:
     # An element_index with no snapshot at all is the same mistake in a worse
