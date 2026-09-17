@@ -13,6 +13,13 @@ from openjiuwen.harness_protocol import JsonObject
 from openjiuwen.harness_providers.skills import SkillSource, normalize_skills
 
 _PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto")
+# Per-line stdout buffer ceiling (bytes) for the Claude SDK NDJSON transport.
+# Tool results that embed large payloads (a base64 image read via the CLI Read
+# tool is roughly 4/3 of the file size) blow past the SDK's 1 MiB default with
+# a decode error that kills the turn, so raise it. The buffer is a transient
+# per-line string, so the memory cost only appears while a large message is
+# in flight.
+DEFAULT_CLAUDE_MAX_BUFFER_SIZE = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +77,7 @@ class ClaudeCodeHarnessConfig:
     system_prompt_mode: Literal["append", "replace"] = "append"
     include_partial_messages: bool = True
     max_turns: int | None = None
+    max_buffer_size: int | None = None
     settings: str | None = None
     settings_env: Mapping[str, str] = field(default_factory=dict, repr=False)
     event_buffer_capacity: int = 1024
@@ -99,6 +107,11 @@ class ClaudeCodeHarnessConfig:
         if self.max_turns is not None:
             if isinstance(self.max_turns, bool) or not isinstance(self.max_turns, int) or self.max_turns <= 0:
                 raise ValueError("Claude max_turns must be a positive integer when provided")
+        if self.max_buffer_size is not None:
+            if isinstance(self.max_buffer_size, bool) or not isinstance(self.max_buffer_size, int):
+                raise TypeError("Claude max_buffer_size must be an integer when provided")
+            if self.max_buffer_size <= 0:
+                raise ValueError("Claude max_buffer_size must be a positive integer when provided")
         if isinstance(self.event_buffer_capacity, bool) or not isinstance(self.event_buffer_capacity, int):
             raise TypeError("Claude event_buffer_capacity must be an integer")
         if self.event_buffer_capacity <= 0:
@@ -133,4 +146,4 @@ class ClaudeCodeHarnessConfig:
         return cls(**values)  # type: ignore[arg-type]
 
 
-__all__ = ["ClaudeCodeHarnessConfig", "ClaudeModelConfig"]
+__all__ = ["ClaudeCodeHarnessConfig", "ClaudeModelConfig", "DEFAULT_CLAUDE_MAX_BUFFER_SIZE"]

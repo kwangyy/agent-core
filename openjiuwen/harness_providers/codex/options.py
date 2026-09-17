@@ -219,26 +219,38 @@ async def append_developer_instructions(client: Any, sdk: Any, config: CodexHarn
     return "\n\n".join(part for part in (existing, system_prompt) if part)
 
 
-async def start_thread_with_raw_events(*, client: Any, sdk: Any, options: dict[str, Any]) -> Any:
+async def start_thread_with_raw_events(
+    *,
+    client: Any,
+    sdk: Any,
+    options: dict[str, Any],
+) -> tuple[Any, str]:
     """Start a thread with App Server model-response notifications enabled.
 
     Newer SDKs may expose ``experimental_raw_events`` directly. The currently
     supported SDK can still send the App Server field through its low-level
     JSON-RPC client, so keep that compatibility code isolated here.
+
+    Returns ``(thread, model)`` where ``model`` is the effective model the App
+    Server confirmed on the response (``ThreadStartResponse.model``) — the
+    ``Thread`` object itself carries no model field, and the value is what the
+    reliability context reports on retry/failure events.
     """
     thread_start = client.thread_start
     signature = inspect.signature(thread_start)
     parameters = signature.parameters.values()
     accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
     if "experimental_raw_events" in signature.parameters or accepts_kwargs:
-        return await thread_start(experimental_raw_events=True, **options)
+        response = await thread_start(experimental_raw_events=True, **options)
+        return response, str(getattr(response, "model", "") or "")
 
     ensure_initialized = getattr(client, "_ensure_initialized", None)
     low_level_client = getattr(client, "_client", None)
     async_thread_type = getattr(sdk, "AsyncThread", None)
     if not callable(ensure_initialized) or low_level_client is None or async_thread_type is None:
         logger.warning("[codex] SDK does not expose experimental raw events; falling back to thread_start")
-        return await thread_start(**options)
+        response = await thread_start(**options)
+        return response, str(getattr(response, "model", "") or "")
 
     try:
         from openai_codex._approval_mode import _approval_mode_settings
@@ -259,10 +271,14 @@ async def start_thread_with_raw_events(*, client: Any, sdk: Any, options: dict[s
         request["experimentalRawEvents"] = True
         await ensure_initialized()
         started = await low_level_client.thread_start(request)
-        return async_thread_type(client, started.thread.id)
+        return (
+            async_thread_type(client, started.thread.id),
+            str(getattr(started, "model", "") or ""),
+        )
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
         logger.warning("[codex] raw-event compatibility path is unavailable (%s); using thread_start", exc)
-        return await thread_start(**options)
+        response = await thread_start(**options)
+        return response, str(getattr(response, "model", "") or "")
 
 
 __all__ = [

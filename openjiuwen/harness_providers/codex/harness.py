@@ -31,7 +31,6 @@ from openjiuwen.harness_protocol import (
     UserInputRequest,
     json_value_to_builtin,
 )
-from openjiuwen.harness_providers.skills import install_skills
 from openjiuwen.harness_providers.base import (
     PendingTurn,
     ProviderStartupError,
@@ -44,8 +43,8 @@ from openjiuwen.harness_providers.codex.config import CodexHarnessConfig, CodexM
 from openjiuwen.harness_providers.codex.failure_classifier import classify_codex_exception
 from openjiuwen.harness_providers.codex.mapping import PROVIDER_NAME, CodexTurnAccumulator
 from openjiuwen.harness_providers.codex.options import (
-    build_codex_config,
     append_developer_instructions,
+    build_codex_config,
     build_process_env,
     build_thread_options,
     load_codex_sdk,
@@ -53,6 +52,7 @@ from openjiuwen.harness_providers.codex.options import (
 )
 from openjiuwen.harness_providers.inputs import harness_input_text
 from openjiuwen.harness_providers.jsonsafe import to_json_object, to_json_safe
+from openjiuwen.harness_providers.skills import install_skills
 
 ADAPTER_VERSION = "0.1.0"
 _INTERRUPT_TIMEOUT_S = 5.0
@@ -68,6 +68,9 @@ USER_INPUT_METHOD = "item/tool/requestUserInput"
 _INTERACTIVE_HOST_CAPABILITIES = frozenset({HostCapability.TOOL_APPROVAL, HostCapability.USER_INPUT})
 # Provider interaction asking the host to ratify (persist) an auth fallback.
 AUTH_FALLBACK_REQUEST_TYPE = "auth_fallback"
+# Provider event announcing the active model (session activation / fallback
+# switch) so the host reliability context can attribute failures to it.
+_MODEL_CHANGED_EVENT = "session/model_changed"
 
 NotificationObserver = Callable[[Any], None]
 
@@ -143,6 +146,7 @@ class CodexHarness(SerializedTurnHarness):
         self._client: Any = None
         self._thread: Any = None
         self._thread_id: str | None = None
+        self._confirmed_model = ""
         self._active_handle: Any = None
         self._pending_steers: list[str] = []
         self._active_model: CodexModelConfig | None = self._config.model
@@ -195,6 +199,7 @@ class CodexHarness(SerializedTurnHarness):
                     provider_data=error.provider_data,
                 )
             raise ProviderStartupError(f"Codex startup failed: {type(exc).__name__}", error=error) from exc
+        await self._emit_model_changed()
         await self._publish_checkpoint(
             {"thread_id": self._thread_id, "resumed": resume_thread_id is not None},
             reason=CheckpointReason.SESSION_ACTIVATED,
@@ -234,6 +239,7 @@ class CodexHarness(SerializedTurnHarness):
                 options["developer_instructions"] = await append_developer_instructions(
                     client, sdk, self._config, cwd=cwd, system_prompt=context.system_prompt,
                 )
+            confirmed_model = ""
             if resume_thread_id is not None:
                 options.pop("ephemeral", None)
                 thread = await client.thread_resume(resume_thread_id, **options)
@@ -242,10 +248,12 @@ class CodexHarness(SerializedTurnHarness):
                     raise HarnessProtocolError(
                         f"Codex resumed unexpected thread {resumed_id!r}; expected {resume_thread_id!r}"
                     )
+                confirmed_model = str(getattr(thread, "model", "") or "")
             elif self._config.experimental_raw_events:
-                thread = await start_thread_with_raw_events(client=client, sdk=sdk, options=options)
+                thread, confirmed_model = await start_thread_with_raw_events(client=client, sdk=sdk, options=options)
             else:
                 thread = await client.thread_start(**options)
+                confirmed_model = str(getattr(thread, "model", "") or "")
         except BaseException:
             with contextlib.suppress(Exception):
                 await client.close()
@@ -253,6 +261,12 @@ class CodexHarness(SerializedTurnHarness):
         self._client = client
         self._thread = thread
         self._thread_id = str(thread.id)
+        # The App Server response echoes the model it resolved — including
+        # members spawned without an explicit model — and it is the value the
+        # reliability context reports on retry/failure events. The ``Thread``
+        # object itself carries no model field, so keep the confirmed value
+        # separate instead of reading it off ``self._thread``.
+        self._confirmed_model = confirmed_model
 
     async def _close_session(self) -> None:
         handle = self._active_handle
@@ -262,6 +276,7 @@ class CodexHarness(SerializedTurnHarness):
         client = self._client
         self._client = None
         self._thread = None
+        self._confirmed_model = ""
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
@@ -440,18 +455,20 @@ class CodexHarness(SerializedTurnHarness):
         self,
         error: TurnError | None,
         fallback: CodexModelConfig | None,
-        accumulator: CodexTurnAccumulator,
         turn: PendingTurn,
     ) -> bool:
         """Report whether the auth fallback may still replace this turn.
 
-        The fallback is a one-shot early switch: it only makes sense while the
-        turn has produced nothing a caller could already have consumed.
+        The category itself is the gate: an ``auth_required`` failure means the
+        request never reached the model on the native endpoint, so replaying
+        the turn on the fallback cannot duplicate meaningful work. A mid-turn
+        token expiry may have emitted partial output before failing; replaying
+        it is still preferred over failing the turn, and no worse than the
+        manual retry the caller would perform anyway.
 
         Args:
             error: The failure classified so far, when there is one.
             fallback: The configured fallback endpoint, when there is one.
-            accumulator: Collector holding whatever the turn already emitted.
             turn: The turn being considered for a restart.
 
         Returns:
@@ -461,7 +478,31 @@ class CodexHarness(SerializedTurnHarness):
             return False
         if error.category != "auth_required" or self._fallback_activated:
             return False
-        return not accumulator.emitted_output and not turn.abort_requested
+        return not turn.abort_requested
+
+    async def _emit_model_changed(self) -> None:
+        """Announce the model the Codex thread actually runs on.
+
+        ``RuntimeReliabilityContext`` reports the model on external-runtime
+        failure messages; without this event it stays empty and failures say
+        ``model=<unknown>`` even though the thread is serving requests. The
+        App Server confirms the resolved model on the thread start/resume
+        response — including members spawned without an explicit
+        ``model_name`` — and ``model/rerouted`` notifications update it when
+        the server re-routes mid-session.
+        """
+        model = self._confirmed_model
+        if not model:
+            configured = self._active_model
+            model = configured.model if configured is not None else ""
+        await self._emit(
+            ProviderEvent(
+                provider=PROVIDER_NAME,
+                event_type=_MODEL_CHANGED_EVENT,
+                schema_version="1",
+                payload={"model": model} if model else {},
+            ),
+        )
 
     async def _maybe_activate_fallback(
         self,
@@ -470,7 +511,7 @@ class CodexHarness(SerializedTurnHarness):
         turn: PendingTurn,
     ) -> bool:
         fallback = self._config.fallback_model
-        if not self._fallback_applies(error, fallback, accumulator, turn):
+        if not self._fallback_applies(error, fallback, turn):
             return False
         context = self._context
         if context is None:
@@ -495,9 +536,14 @@ class CodexHarness(SerializedTurnHarness):
                 await self._connect(context, model=self._config.model, resume_thread_id=thread_id)
             except Exception as exc:
                 logger.warning("[codex] restoring the native endpoint failed: %s", exc)
+                return False
+            self._active_model = self._config.model
+            self._fallback_activated = False
+            await self._emit_model_changed()
             return False
         self._active_model = fallback
         self._fallback_activated = True
+        await self._emit_model_changed()
         await self._publish_checkpoint(
             {"thread_id": self._thread_id, "resumed": True, "fallback": True},
             reason=CheckpointReason.STATE_CHANGED,

@@ -62,6 +62,14 @@ _EXTERNAL_BACKEND_KEY = "backend"
 _EXTERNAL_CHECKPOINT_KEY = "checkpoint"
 _AUTH_FALLBACK_EVENT = "auth_fallback_activated"
 _AUTH_FALLBACK_REQUEST = "auth_fallback"
+# Provider events carrying the model a member actually runs on, fed into the
+# reliability context so failure reports name the endpoint instead of
+# ``<unknown>``: Codex harnesses announce the thread's model
+# (``session/model_changed``), and the Claude CLI reports the model it serves
+# in every ``system/init`` message — the only source with a value when no
+# model was configured explicitly.
+_MODEL_CHANGED_EVENT = "session/model_changed"
+_SYSTEM_INIT_EVENT = "system/init"
 
 ContextFactory = Callable[
     [Any | None],
@@ -521,6 +529,13 @@ class ExternalHarnessMemberRuntime:
                 self._member_name,
                 payload.payload,
             )
+        elif isinstance(payload, ProviderEvent) and (
+            payload.event_type == _MODEL_CHANGED_EVENT or payload.event_type == _SYSTEM_INIT_EVENT
+        ):
+            ctx = self._reliability_ctx
+            model = payload.payload.get("model")
+            if ctx is not None and isinstance(model, str) and model.strip():
+                ctx.update_model(model)
 
     async def _on_turn_event(self, envelope: HarnessEvent, payload: TurnLifecycleEvent) -> None:
         kind = _member_round_kind(payload.kind)

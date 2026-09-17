@@ -383,6 +383,19 @@ class ExternalCliAgentSpec(BaseModel):
     of hanging forever.
     """
 
+    claude_max_buffer_size: int | None = Field(default=None, ge=1)
+    """Optional per-line stdout buffer ceiling (bytes) for the Claude SDK
+    transport; ``None`` keeps the harness default (32 MiB).
+
+    The SDK reads NDJSON (one message per line) and rejects any single line
+    beyond this bound with a decode error, killing the turn. Tool results
+    that embed large payloads (a base64 image read via the CLI Read tool is
+    roughly 4/3 of the file size) blow past the SDK's 1 MiB default, which is
+    why the effective default is raised far above it. The buffer is a
+    transient per-line string, so the memory cost only appears while a large
+    message is in flight.
+    """
+
     mcp_server_command: list[str] = Field(default_factory=lambda: ["openjiuwen-team-mcp"])
     """Launch argv for the team MCP stdio server registered with the CLI.
     Defaults to the ``openjiuwen-team-mcp`` console-script entry."""
@@ -438,6 +451,8 @@ class ExternalCliAgentSpec(BaseModel):
             raise ValueError("codex_turn_idle_retries is only valid when cli_agent='codex'")
         if self.cli_agent != "claude" and self.claude_turn_idle_timeout_s is not None:
             raise ValueError("claude_turn_idle_timeout_s is only valid when cli_agent='claude'")
+        if self.cli_agent != "claude" and "claude_max_buffer_size" in self.model_fields_set:
+            raise ValueError("claude_max_buffer_size is only valid when cli_agent='claude'")
         if self.cli_agent not in {"claude", "codex"} and self.external_model_config is not None:
             raise ValueError("model_config is only valid when cli_agent is 'claude' or 'codex'")
         return self

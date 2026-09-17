@@ -198,6 +198,7 @@ def build_claude_options(
         system_prompt=prompt_option,
         include_partial_messages=config.include_partial_messages,
         max_turns=config.max_turns,
+        max_buffer_size=config.max_buffer_size,
         can_use_tool=can_use_tool,
         stderr=stderr,
     )

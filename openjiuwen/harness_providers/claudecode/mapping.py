@@ -62,7 +62,6 @@ class ClaudeTurnAccumulator:
         self.messages: list[TurnMessage] = []
         self.last_text_output = ""
         self.pending_error: TurnError | None = None
-        self.emitted_output = False
         self._message_index = 0
         self._stream_message_open = False
         self._tool_names: dict[str, str] = {}
@@ -122,7 +121,6 @@ class ClaudeTurnAccumulator:
             return []
         if not isinstance(text, str) or not text:
             return []
-        self.emitted_output = True
         return [
             MappedClaudeEvent(
                 OutputEvent(
@@ -366,7 +364,6 @@ class ClaudeTurnAccumulator:
     # ------------------------------------------------------------------
 
     def _final_output(self, message_index: int, index: int, channel: OutputChannel, text: str) -> MappedClaudeEvent:
-        self.emitted_output = True
         return MappedClaudeEvent(
             OutputEvent(
                 output_id=self._output_id(message_index, index, channel),

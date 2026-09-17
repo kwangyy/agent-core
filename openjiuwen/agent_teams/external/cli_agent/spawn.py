@@ -38,7 +38,12 @@ from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.harness_protocol import HarnessContext, McpServerConfig, McpTransport
 from openjiuwen.harness_providers.skills import SkillSource
-from openjiuwen.harness_providers.claudecode import ClaudeCodeHarness, ClaudeCodeHarnessConfig, ClaudeModelConfig
+from openjiuwen.harness_providers.claudecode import (
+    ClaudeCodeHarness,
+    ClaudeCodeHarnessConfig,
+    ClaudeModelConfig,
+    DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+)
 from openjiuwen.harness_providers.claudecode.options import strip_parent_claude_env
 from openjiuwen.harness_providers.codex import CodexHarness, CodexHarnessConfig, CodexModelConfig
 
@@ -197,6 +202,7 @@ async def build_cli_runtime(
     codex_turn_idle_timeout_s: float | None = None,
     codex_turn_idle_retries: int | None = None,
     claude_turn_idle_timeout_s: float | None = None,
+    claude_max_buffer_size: int | None = None,
     external_model_config: ExternalCliModelConfig | None = None,
     fallback_external_model_config: ExternalCliModelConfig | None = None,
     promote_fallback_model: Callable[[], Awaitable[bool]] | None = None,
@@ -248,6 +254,9 @@ async def build_cli_runtime(
             stalled turn emitted no SDK notifications and was interrupted.
         claude_turn_idle_timeout_s: Optional Claude-only inactivity ceiling for
             one SDK turn. Every received SDK message refreshes it.
+        claude_max_buffer_size: Optional Claude-only per-line stdout buffer
+            ceiling (bytes) for the SDK transport. ``None`` keeps the
+            :class:`ClaudeCodeHarnessConfig` default.
         external_model_config: Optional model endpoint config translated into
             backend-specific SDK options.
         fallback_external_model_config: Optional endpoint used only after an
@@ -314,6 +323,7 @@ async def build_cli_runtime(
             cli_path=cli_path,
             inject_mcp=inject_mcp,
             mcp_server_name=mcp_server_name,
+            max_buffer_size=claude_max_buffer_size,
             external_model_config=external_model_config,
             fallback_external_model_config=fallback_external_model_config,
             promote_fallback_model=promote_fallback_model,
@@ -337,6 +347,11 @@ async def build_cli_runtime(
             raise_error(
                 StatusCode.AGENT_TEAM_CONFIG_INVALID,
                 reason="claude_turn_idle_timeout_s is only supported for Claude SDK members",
+            )
+        if claude_max_buffer_size is not None:
+            raise_error(
+                StatusCode.AGENT_TEAM_CONFIG_INVALID,
+                reason="claude_max_buffer_size is only supported for Claude SDK members",
             )
         if ssh_transport is not None:
             raise_error(
@@ -397,6 +412,11 @@ async def build_cli_runtime(
         raise_error(
             StatusCode.AGENT_TEAM_CONFIG_INVALID,
             reason="claude_turn_idle_timeout_s is only supported for Claude SDK members",
+        )
+    if claude_max_buffer_size is not None:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID,
+            reason="claude_max_buffer_size is only supported for Claude SDK members",
         )
 
     adapter: CliAgentAdapter = build_adapter(ctx.cli_agent, command_override=command_override)
@@ -519,6 +539,7 @@ async def _build_claude_member_runtime(
     cli_path: str | None,
     inject_mcp: bool,
     mcp_server_name: str,
+    max_buffer_size: int | None = DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     external_model_config: ExternalCliModelConfig | None,
     fallback_external_model_config: ExternalCliModelConfig | None,
     promote_fallback_model: Callable[[], Awaitable[bool]] | None,
@@ -533,6 +554,10 @@ async def _build_claude_member_runtime(
     team_context_tracker: Any,
 ) -> ExternalHarnessMemberRuntime:
     """Build a Claude Code member runtime on the protocol harness."""
+    if max_buffer_size is None:
+        # An explicit None must not fall back to the SDK's 1 MiB default —
+        # a single large tool result (e.g. a base64 image) would kill the turn.
+        max_buffer_size = DEFAULT_CLAUDE_MAX_BUFFER_SIZE
     if ssh_transport is None:
         base_env = strip_parent_claude_env(dict(os.environ))
     else:
@@ -577,6 +602,7 @@ async def _build_claude_member_runtime(
         cli_path=cli_path,
         model=_claude_model(external_model_config),
         fallback_model=fallback_model,
+        max_buffer_size=max_buffer_size,
     )
     transport_factory = None
     if ssh_transport is not None:

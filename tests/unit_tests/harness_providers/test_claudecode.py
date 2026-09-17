@@ -341,7 +341,70 @@ async def test_failed_result_is_classified(monkeypatch: pytest.MonkeyPatch) -> N
     assert terminal.result.error.category == "rate_limited"
     assert terminal.result.error.provider_data["http_status"] == 429
     assert classify_result_message(_result(sdk, is_error=True, api_error_status=401)).category == "auth_required"
+    # A failed ResultMessage ends the turn normally: the client stays usable.
+    assert len(state.clients) == 1 and not state.clients[0].disconnected
     await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_turn_exception_drops_client_and_next_turn_reconnects(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk, state = _install_fake_sdk(monkeypatch)
+
+    async def _explode(client: _FakeClient) -> Any:
+        raise RuntimeError("JSON message exceeded maximum buffer size")
+
+    state.scripts.append([_explode])
+    state.scripts.append([_result(sdk, result="recovered")])
+    harness = ClaudeCodeHarness(ClaudeCodeHarnessConfig(inherit_process_env=False))
+    await harness.start(_context())
+    first = state.clients[0]
+
+    receipt = await harness.send(HarnessInput(content="read the big image"))
+    terminal = _terminal(await _turn(harness, receipt.turn_id))
+    assert terminal.kind is TurnEventKind.FAILED
+    # The SDK read task died with the exception; the client must be dropped so
+    # the next turn does not reuse a message stream that only yields nothing.
+    assert first.disconnected
+
+    receipt = await harness.send(HarnessInput(content="retry"))
+    terminal = _terminal(await _turn(harness, receipt.turn_id))
+    assert terminal.kind is TurnEventKind.FINISHED
+    assert terminal.result.final_output == "recovered"
+    # A fresh client served the retry, and it resumed the same CLI session.
+    assert len(state.clients) == 2
+    assert state.clients[1].queries == ["retry"]
+    assert state.clients[1].options.resume == harness.provider_session_id
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_empty_stream_drops_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk, state = _install_fake_sdk(monkeypatch)
+    state.scripts.append([])  # stream ends without a ResultMessage
+    harness = ClaudeCodeHarness(ClaudeCodeHarnessConfig(inherit_process_env=False))
+    await harness.start(_context())
+    receipt = await harness.send(HarnessInput(content="hi"))
+    terminal = _terminal(await _turn(harness, receipt.turn_id))
+    assert terminal.kind is TurnEventKind.FAILED
+    assert terminal.result.error.code == "CLAUDE_MISSING_RESULT"
+    assert state.clients[0].disconnected
+    await harness.stop()
+
+
+def test_max_buffer_size_config_flows_to_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk, state = _install_fake_sdk(monkeypatch)
+    config = ClaudeCodeHarnessConfig.from_mapping({"max_buffer_size": 32 * 1024 * 1024})
+    assert config.max_buffer_size == 32 * 1024 * 1024
+    with pytest.raises(ValueError, match="max_buffer_size"):
+        ClaudeCodeHarnessConfig(max_buffer_size=0)
+
+    async def _run() -> None:
+        harness = ClaudeCodeHarness(config)
+        await harness.start(_context())
+        await harness.stop()
+
+    asyncio.run(_run())
+    assert state.clients[0].options.max_buffer_size == 32 * 1024 * 1024
 
 
 @pytest.mark.asyncio
@@ -410,8 +473,18 @@ async def test_ask_user_question_routes_to_the_host_and_resume_uses_checkpoint(m
 @pytest.mark.asyncio
 async def test_auth_failure_activates_fallback_once(monkeypatch: pytest.MonkeyPatch) -> None:
     sdk, state = _install_fake_sdk(monkeypatch)
-    state.scripts.append([_result(sdk, is_error=True, subtype="error", api_error_status=401, errors=["auth"])])
-    state.scripts.append([_result(sdk, result="fallback ok")])
+    state.scripts.append(
+        [
+            sdk.SystemMessage(subtype="init", data={"model": "native-model"}),
+            _result(sdk, is_error=True, subtype="error", api_error_status=401, errors=["auth"]),
+        ]
+    )
+    state.scripts.append(
+        [
+            sdk.SystemMessage(subtype="init", data={"model": "fallback-model"}),
+            _result(sdk, result="fallback ok"),
+        ]
+    )
     harness = ClaudeCodeHarness(
         ClaudeCodeHarnessConfig(
             inherit_process_env=False,
@@ -431,6 +504,104 @@ async def test_auth_failure_activates_fallback_once(monkeypatch: pytest.MonkeyPa
     assert any(
         isinstance(event.event, ProviderEvent) and event.event.event_type == "auth_fallback_activated" for event in events
     )
+    # Each CLI session reports the model it serves via ``system/init`` —
+    # including members spawned without an explicit model — and the fallback
+    # client's init carries the fallback model.
+    init_models = [
+        event.event.payload.get("model")
+        for event in events
+        if isinstance(event.event, ProviderEvent) and event.event.event_type == "system/init"
+    ]
+    assert init_models == ["native-model", "fallback-model"]
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_not_logged_in_text_still_activates_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk, state = _install_fake_sdk(monkeypatch)
+    # The CLI reports a missing login as synthetic assistant text plus an
+    # error result without ``errors``; the text must not count as consumed
+    # output and block the one-shot auth fallback replay.
+    state.scripts.append(
+        [
+            sdk.SystemMessage(subtype="init", data={"model": "native-model"}),
+            sdk.AssistantMessage(
+                content=[sdk.TextBlock(text="Not logged in · Please run /login")],
+                model="native-model",
+                parent_tool_use_id=None,
+                error=None,
+                usage=None,
+                message_id="msg-1",
+                stop_reason=None,
+                session_id="s",
+            ),
+            _result(sdk, is_error=True, subtype="success", api_error_status=401),
+        ]
+    )
+    state.scripts.append(
+        [
+            sdk.SystemMessage(subtype="init", data={"model": "fallback-model"}),
+            _result(sdk, result="fallback ok"),
+        ]
+    )
+    harness = ClaudeCodeHarness(
+        ClaudeCodeHarnessConfig(
+            inherit_process_env=False,
+            fallback_model=ClaudeModelConfig(model="fallback-model", api_base="https://alt", api_key="k"),
+        )
+    )
+    await harness.start(_context())
+    receipt = await harness.send(HarnessInput(content="hi"))
+    events = await _turn(harness, receipt.turn_id)
+    terminal = _terminal(events)
+    assert terminal.kind is TurnEventKind.FINISHED
+    assert terminal.result.final_output == "fallback ok"
+    assert harness.fallback_activated
+    # The diagnostic text survives as the first attempt's failure reason only
+    # when the turn actually fails; here the fallback recovered the turn.
+    await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_after_partial_output_still_activates_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk, state = _install_fake_sdk(monkeypatch)
+    # Partial work before a mid-turn token expiry: the category is the gate,
+    # not the emitted output — replaying on the fallback is preferred over
+    # failing the turn (and no worse than the manual retry that would follow).
+    state.scripts.append(
+        [
+            sdk.SystemMessage(subtype="init", data={"model": "native-model"}),
+            sdk.AssistantMessage(
+                content=[
+                    sdk.TextBlock(text="let me check"),
+                    sdk.ToolUseBlock(id="tool-1", name="Bash", input={"command": "ls"}),
+                ],
+                model="native-model",
+                parent_tool_use_id=None,
+                error=None,
+                usage=None,
+                message_id="msg-1",
+                stop_reason="tool_use",
+                session_id="s",
+            ),
+            _result(sdk, is_error=True, subtype="error", api_error_status=401, errors=["auth"]),
+        ]
+    )
+    state.scripts.append([_result(sdk, result="fallback ok")])
+    harness = ClaudeCodeHarness(
+        ClaudeCodeHarnessConfig(
+            inherit_process_env=False,
+            fallback_model=ClaudeModelConfig(model="fallback-model", api_base="https://alt", api_key="k"),
+        )
+    )
+    await harness.start(_context())
+    receipt = await harness.send(HarnessInput(content="hi"))
+    events = await _turn(harness, receipt.turn_id)
+    terminal = _terminal(events)
+    assert terminal.kind is TurnEventKind.FINISHED
+    assert terminal.result.final_output == "fallback ok"
+    assert harness.fallback_activated
+    assert len(state.clients) == 2  # native client replaced by the fallback
     await harness.stop()
 
 
