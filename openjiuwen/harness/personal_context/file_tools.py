@@ -1,3 +1,6 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
 """PersonalContext-only filesystem tool assembly and bounded text search."""
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from openjiuwen.core.foundation.tool import Tool, ToolCard
+from openjiuwen.core.foundation.tool.base import render_tool_output
 from openjiuwen.core.foundation.tool.function.function import LocalFunction
 from openjiuwen.core.sys_operation import SysOperation
 from openjiuwen.harness.personal_context.config import (
@@ -32,6 +36,7 @@ from openjiuwen.harness.tools.filesystem import (
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
+    render_grep_output,
 )
 
 _DEFAULT_HEAD_LIMIT = 250
@@ -173,7 +178,7 @@ def _make_personal_context_write_file_tool(
             return ToolOutput(success=False, error=error)
         return await delegate.invoke(inputs)
 
-    return LocalFunction(card=delegate.card, func=write_file)
+    return LocalFunction(card=delegate.card, func=write_file, render=delegate.render_for_llm)
 
 
 def _make_personal_context_edit_file_tool(
@@ -188,7 +193,7 @@ def _make_personal_context_edit_file_tool(
             return ToolOutput(success=False, error=error)
         return await delegate.invoke(inputs)
 
-    return LocalFunction(card=delegate.card, func=edit_file)
+    return LocalFunction(card=delegate.card, func=edit_file, render=delegate.render_for_llm)
 
 
 def _safe_relative_directory(sandbox: Path, directory: Path) -> str:
@@ -567,7 +572,7 @@ def _make_bounded_grep_tool(sandbox: Path) -> LocalFunction:
         "en",
         options=ToolCardBuildOptions(parallel_safe=True),
     )
-    return LocalFunction(card=card, func=grep)
+    return LocalFunction(card=card, func=grep, render=render_grep_output)
 
 
 def _assert_markdown_move_tree(source: Path) -> str:
@@ -681,6 +686,16 @@ def _move_context_path(
     )
 
 
+def _render_move_path_output(output: ToolOutput) -> str:
+    if not output.success:
+        return render_tool_output(output)
+    data = output.data
+    return (
+        f"Moved {data['kind']} context/{data['source_path']} to context/{data['destination_path']}; "
+        "links were not rewritten."
+    )
+
+
 def _make_move_path_tool(
     sandbox: Path,
     *,
@@ -717,6 +732,7 @@ def _make_move_path_tool(
             idempotent=False,
         ),
         func=move_path,
+        render=_render_move_path_output,
     )
 
 

@@ -155,7 +155,7 @@ def _wrap_team_tool(
         except Exception as exc:  # noqa: BLE001 - keep tool failures in-band
             team_logger.exception("claude sdk team tool {} failed", name)
             return text_content(f"Internal error: {exc}")
-        return text_content(str(result))
+        return text_content(tool.render_for_llm(result))
 
     return sdk.tool(
         name=name,

@@ -129,7 +129,7 @@ class _SpawnToolBase(TeamTool, ABC):
             error=None if result.ok else result.reason,
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to spawn member"
         d = output.data
@@ -374,7 +374,7 @@ class CheckpointTool(TeamTool):
             data={"name": name, "message_count": count},
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to save checkpoint"
         d = output.data
@@ -411,7 +411,7 @@ class ListCheckpointsTool(TeamTool):
             data={"checkpoints": items, "count": len(items)},
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to list checkpoints"
         checkpoints = output.data["checkpoints"]
@@ -887,7 +887,7 @@ class ShutdownMemberTool(TeamTool):
             error=None if result.ok else result.reason,
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to shutdown member"
         return f"Member shutdown: member_name={output.data['member_name']}"
@@ -935,7 +935,7 @@ class ApprovePlanTool(TeamTool):
             error=None if success else "Failed to approve/reject plan",
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to approve/reject plan"
         d = output.data
@@ -987,7 +987,7 @@ class ApproveToolCallTool(TeamTool):
             error=None if success else "Failed to approve/reject tool call",
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to approve/reject tool call"
         d = output.data
@@ -1017,7 +1017,7 @@ class ListMembersTool(TeamTool):
             success=True, data={"members": [member.model_dump() for member in members], "count": len(members)}
         )
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to list members"
         members = output.data["members"]

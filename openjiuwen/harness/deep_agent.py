@@ -2275,17 +2275,17 @@ class DeepAgent(BaseAgent):
         for event, callback in callbacks.items():
             if event in _BRIDGE_EVENTS:
                 if self._react_agent is not None:
-                    await self._react_agent.register_callback(event, callback, rail.priority)
+                    await self._react_agent.register_callback(event, callback, rail.callback_priority(event))
                 continue
 
             if event in _OUTER_ONLY_EVENTS or event in _DEEP_EVENTS:
-                await self.register_callback(event, callback, rail.priority)
+                await self.register_callback(event, callback, rail.callback_priority(event))
                 continue
 
             logger.warning(
                 f"Unknown rail event {event}, registering on outer DeepAgent"
             )
-            await self.register_callback(event, callback, rail.priority)
+            await self.register_callback(event, callback, rail.callback_priority(event))
 
         self._registered_rails.append(rail)
 

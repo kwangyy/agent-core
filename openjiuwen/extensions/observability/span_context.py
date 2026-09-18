@@ -515,11 +515,6 @@ _trajectory_subject_state_lock = threading.Lock()
 # every attempt of one operation reports the same number.
 _context_compaction_numbers: dict[tuple[str, str], dict[str, int]] = {}
 _context_compaction_number_lock = threading.Lock()
-_pending_context_window_compactions: dict[
-    tuple[str, str, str],
-    list[str],
-] = {}
-_pending_context_window_compactions_lock = threading.Lock()
 _ambient_root_span: Span | None = None
 
 
@@ -591,78 +586,27 @@ def context_compaction_number(
     return number
 
 
-def queue_context_window_compaction(
+def current_context_window_messages(
     *,
     session_id: str,
     subject_id: str,
-    step_id: str,
-    operation_id: str,
-) -> bool:
-    """Queue one completed compaction for its next matching context window.
+) -> list[dict[str, Any]] | None:
+    """Return the messages of one subject's last committed context window.
+
+    The canonical state keeps each message as its serialized fingerprint,
+    which is the message itself in JSON form, so the window is rebuilt from
+    it without a second copy of every message.
 
     Returns:
-        Whether the compaction was queued. False means the caller could not
-        name the step it belongs to, so no window will ever claim it.
+        The messages in window order, or None when the subject has not
+        committed a window yet.
     """
-    key = _context_window_transition_key(
-        session_id=session_id,
-        subject_id=subject_id,
-        step_id=step_id,
-    )
-    resolved_operation_id = str(operation_id or "").strip()
-    if key is None or not resolved_operation_id:
-        return False
-    with _pending_context_window_compactions_lock:
-        pending = _pending_context_window_compactions.setdefault(key, [])
-        if resolved_operation_id not in pending:
-            pending.append(resolved_operation_id)
-    return True
-
-
-def consume_context_window_compaction(
-    *,
-    session_id: str,
-    subject_id: str,
-    step_id: str,
-) -> str | None:
-    """Consume the oldest compaction for exactly one routed context window."""
-    key = _context_window_transition_key(
-        session_id=session_id,
-        subject_id=subject_id,
-        step_id=step_id,
-    )
-    if key is None:
-        return None
-    with _pending_context_window_compactions_lock:
-        pending = _pending_context_window_compactions.get(key)
-        if not pending:
+    key = (_normalize_session_id(session_id), str(subject_id))
+    with _trajectory_subject_state_lock:
+        state = _trajectory_subject_states.get(key)
+        if state is None:
             return None
-        operation_id = pending.pop(0)
-        if not pending:
-            _pending_context_window_compactions.pop(key, None)
-        return operation_id
-
-
-def _context_window_transition_key(
-    *,
-    session_id: str,
-    subject_id: str,
-    step_id: str,
-) -> tuple[str, str, str] | None:
-    """Scope one compaction to the step whose next window states its output.
-
-    The step is the finest scope both sides can agree on. A request id cannot
-    be part of this key: a compaction is queued between model calls, so the
-    call that will state its output does not exist yet and has no id to match
-    against -- keying on one left every compaction unclaimed.
-    """
-    values = tuple(
-        str(value or "").strip()
-        for value in (session_id, subject_id, step_id)
-    )
-    if any(not value for value in values):
-        return None
-    return cast(tuple[str, str, str], values)
+        return [json.loads(fingerprint) for _message_id, fingerprint in state[1]]
 
 
 def advance_context_window(
@@ -1072,8 +1016,6 @@ def reset_state() -> None:
         _trajectory_sequence_epoch = uuid.uuid4().hex
         _trajectory_subject_sequences.clear()
         _trajectory_subject_states.clear()
-    with _pending_context_window_compactions_lock:
-        _pending_context_window_compactions.clear()
     with _context_compaction_number_lock:
         _context_compaction_numbers.clear()
 

@@ -73,7 +73,10 @@ Design records: spec `openjiuwen/harness/docs/specs/S_19_harness-providers.md`, 
    emits `llm_output` / `llm_reasoning` / `tool_call` / `tool_result` /
    `__interaction__` chunks and resolves `InteractiveInput` against pending
    interactions; `agent_teams.external.member_runtime` composes it instead of
-   projecting events itself.
+   projecting events itself. A `tool_result` chunk keeps the structured `result`
+   and adds `rendered_result` (the text the model read) as a separate field when
+   the provider supplies it; DeepAgent's `_ObservationRail` carries it through
+   `ItemLifecycleEvent.data` and the tool-result `ContentBlock.data`.
 8. **Provider extensions are ratified before they commit.** A switch that
    changes the provider's persistent identity (today: the Claude Code / Codex
    authentication fallback) goes through

@@ -404,6 +404,8 @@ class CodexSpanBridge:
             AT_TEAM_NAME,
             GEN_AI_OPERATION_NAME,
             OJ_TRAJECTORY_RECORD_KIND,
+            OJ_TRAJECTORY_SCHEMA_VERSION,
+            TRAJECTORY_SPAN_SCHEMA_VERSION,
         )
 
         self._turn_index += 1
@@ -416,6 +418,7 @@ class CodexSpanBridge:
         span.set_attribute(OJ_SPAN_INPUT, safe_prompt)
         span.set_attribute(GEN_AI_OPERATION_NAME, "invoke_agent")
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "agent")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(AT_AGENT_ID, self._member_agent_id)
         span.set_attribute(GEN_AI_AGENT_NAME, self._member_name)
         span.set_attribute(AT_AGENT_ROLE, self._role or self._member_name)
@@ -635,6 +638,8 @@ class CodexSpanBridge:
             GEN_AI_USAGE_REASONING_OUTPUT_TOKENS,
             OJ_REQUEST_MESSAGE_COUNT,
             OJ_TRAJECTORY_RECORD_KIND,
+            OJ_TRAJECTORY_SCHEMA_VERSION,
+            TRAJECTORY_SPAN_SCHEMA_VERSION,
         )
         from openjiuwen.agent_teams.observability.setup import get_tracer
 
@@ -753,6 +758,7 @@ class CodexSpanBridge:
             )
             safe_reasoning = redact_completion(reasoning, config)
             reasoning_span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "reasoning")
+            reasoning_span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
             reasoning_span.set_attribute(
                 GEN_AI_OUTPUT_MESSAGES,
                 _json_text([{
@@ -1059,6 +1065,8 @@ class CodexSpanBridge:
             OJ_SPAN_INPUT,
             OJ_SPAN_OUTPUT,
             OJ_TRAJECTORY_RECORD_KIND,
+            OJ_TRAJECTORY_SCHEMA_VERSION,
+            TRAJECTORY_SPAN_SCHEMA_VERSION,
         )
         from openjiuwen.agent_teams.observability.setup import get_tracer
 
@@ -1088,6 +1096,7 @@ class CodexSpanBridge:
             span.set_attribute(GEN_AI_TOOL_NAME, observation_tool_name)
             span.set_attribute(GEN_AI_OPERATION_NAME, "execute_tool")
             span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "tool")
+            span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
             if observation_tool_name != tool_name:
                 span.set_attribute("codex.tool.logical_name", tool_name)
             span.set_attribute(GEN_AI_TOOL_CALL_ARGUMENTS, safe_input)
@@ -1291,6 +1300,8 @@ class CodexSpanBridge:
             OJ_SPAN_INPUT,
             OJ_SPAN_OUTPUT,
             OJ_TRAJECTORY_RECORD_KIND,
+            OJ_TRAJECTORY_SCHEMA_VERSION,
+            TRAJECTORY_SPAN_SCHEMA_VERSION,
         )
         from openjiuwen.agent_teams.observability.setup import get_tracer
 
@@ -1314,6 +1325,7 @@ class CodexSpanBridge:
                 context=set_span_in_context(summary, otel_context.get_current()),
             )
             reasoning_span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "reasoning")
+            reasoning_span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
             reasoning_span.set_attribute(
                 GEN_AI_OUTPUT_MESSAGES,
                 _json_text([{

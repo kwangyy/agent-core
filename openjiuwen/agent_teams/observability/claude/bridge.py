@@ -37,6 +37,8 @@ from openjiuwen.extensions.observability.semconv import (
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
     OJ_TRAJECTORY_RECORD_KIND,
+    OJ_TRAJECTORY_SCHEMA_VERSION,
+    TRAJECTORY_SPAN_SCHEMA_VERSION,
 )
 from openjiuwen.core.session.stream.base import OutputSchema
 
@@ -189,6 +191,7 @@ class ClaudeSpanBridge:
         span.set_attribute(OJ_SPAN_INPUT, safe_prompt)
         span.set_attribute(GEN_AI_OPERATION_NAME, "invoke_agent")
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "agent")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(AT_AGENT_ID, self._member_agent_id)
         span.set_attribute(GEN_AI_AGENT_NAME, self._member_name)
         span.set_attribute(AT_AGENT_ROLE, self._role or self._member_name)
@@ -675,6 +678,7 @@ class ClaudeSpanBridge:
         span.set_attribute(GEN_AI_TOOL_NAME, tool_name)
         span.set_attribute(GEN_AI_OPERATION_NAME, "execute_tool")
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "tool")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(GEN_AI_TOOL_CALL_ARGUMENTS, safe_input)
         tool_call_id = str(record.get("tool_call_id") or "")
         if tool_call_id:
@@ -715,6 +719,7 @@ class ClaudeSpanBridge:
         )
         safe_reasoning = redact_completion(reasoning, config)
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "reasoning")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(
             GEN_AI_OUTPUT_MESSAGES,
             _json_text([{

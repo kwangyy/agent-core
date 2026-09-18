@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness_providers/`（`base.py` / `stream.py` / `io_adapter.py` / `factory.py` / `inputs.py` / `jsonsafe.py` / `native/` / `claudecode/` / `codex/` / `dsh/`） |
-| 最近一次修订日期 | 2026-09-09 |
+| 最近一次修订日期 | 2026-09-17 |
 | 关联 feature | F_03_harness-providers-and-manifest-factory.md |
 
 ## 范围 / 边界
@@ -53,6 +53,9 @@
    随后创建的 supervisor / scheduler task 才能继承。
 7. **IO adapter 是唯一 DeepAgent 投影**：`HarnessIOAdapter` 输出 `llm_output` / `llm_reasoning` /
    `tool_call` / `tool_result` / `__interaction__`（`InteractionOutput(id=request_id, value=...)`）；
+   `tool_result` 的 `result` 是结构化值，provider 提供模型可见文本时另带独立字段 `rendered_result`
+   （DeepAgent：`_ObservationRail` 写入流式块，`_consume_chunk` 放进 `ItemLifecycleEvent.data` 与
+   `ContentBlock.data`，见 `S_05` 不变量 11）；
    DELTA 直出，FINAL/SNAPSHOT 只补前缀增量；`send(InteractiveInput)` 先应答 pending interaction，
    未匹配时以 `metadata.kind="interactive_input"` 转发；`delivery_mode(immediate)` 按状态与 STEER
    能力选 AUTO / STEER / FOLLOW_UP。

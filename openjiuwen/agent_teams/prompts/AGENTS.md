@@ -56,7 +56,7 @@ Teammate 不消费 workflow / lifecycle 模板；`sections.py` 在 `role != LEAD
 
 唯一装配入口是 `sections.build_team_*_section`：每个模板独立产出一个 `PromptSection`，由 `agent_teams/rails/team_policy_rail.py` 的 `TeamPolicyRail` 按优先级合并进 `SystemPromptBuilder`（外部 CLI 成员则经 `build_team_member_system_prompt` 渲染成独立字符串）。各 builder 直接 `load_template` 读对应 `.md`（如 `build_team_role_section` 读 `leader_policy` / `teammate_policy`）。
 
-**leader 的投递时刻与其他角色不同（[[F_76]] 渐进式披露）**：同样这批 section，teammate / human_agent / bridge 在构造期全部进系统提示词，而 leader 只拿 `team_bootstrap` + `team_extra`，其余经 `build_leader_policy_disclosure` 拼成 `build_team` 的 ToolResult 文本，由 `tools/tool_team.py` 的 `BuildTeamTool.map_result` 附在建队结果之后下发。
+**leader 的投递时刻与其他角色不同（[[F_76]] 渐进式披露）**：同样这批 section，teammate / human_agent / bridge 在构造期全部进系统提示词，而 leader 只拿 `team_bootstrap` + `team_extra`，其余经 `build_leader_policy_disclosure` 拼成 `build_team` 的 ToolResult 文本，由 `tools/tool_team.py` 的 `BuildTeamTool.render_for_llm` 附在建队结果之后下发。
 
 - **为什么是 `build_team`**：它既是团队协同的唯一入口，也是 `dispatch_mode` / `enable_hitt` 等模式变量全部落定的那一刻。在它之前 leader 不需要任何协同准则，在它之后每个变量都已确定——披露边界不是设计出来的，是数据流本来的形状。
 - **收益**：三条协同路径（自主 / 调度 / swarmflow）的文案不再共处一份提示词，leader 永远读不到自己团队不跑的那套约定；HITT 契约的 gate 也从"spec 天花板"变成 `build_team` 解析后的**实际生效值**。

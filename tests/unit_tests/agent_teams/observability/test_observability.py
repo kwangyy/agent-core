@@ -2752,10 +2752,8 @@ def test_usage_keys_are_backend_independent_and_semconv_only() -> None:
         "gen_ai.usage.cache_read.input_tokens": 900,
         "gen_ai.usage.reasoning.output_tokens": 40,
     }
-    # The deprecated ``backend`` selector and the modern ``exporter`` selector
-    # must both yield the same provider-raw token values.
+    # Every exporter selector must yield the same provider-raw token values.
     for config in (
-        ObservabilityConfig(enabled=True, backend="langfuse"),
         ObservabilityConfig(enabled=True, exporter="langfuse"),
         ObservabilityConfig(enabled=True, exporter="otlp_grpc"),
     ):

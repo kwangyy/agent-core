@@ -1025,7 +1025,7 @@ async def test_observability_closes_spans_before_symphony_drains_by_priority() -
         for rail in rails:
             await rail.before_model_call(model_ctx)
         handler = OtelCallbackHandler(
-            ObservabilityConfig(enabled=True, backend="otlp"),
+            ObservabilityConfig(enabled=True),
             tracer=tracer,
         )
         llm_span = handler._open_llm_span({"messages": [{"role": "user", "content": "run"}], "model": "fake"})

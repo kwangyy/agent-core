@@ -43,7 +43,10 @@ from openjiuwen.extensions.observability.demand import (
 )
 from openjiuwen.extensions.observability.span_record_processor import StreamFrameRecord
 from openjiuwen.extensions.observability.error_reporting import record_span_error
-from openjiuwen.extensions.observability.trajectory_events import emit_context_window_commit
+from openjiuwen.extensions.observability.trajectory_events import (
+    REQUEST_SYSTEM_SLOT_PREFIX,
+    emit_context_window_commit,
+)
 from openjiuwen.extensions.observability.semconv import (
     AT_MEMBER_NAME,
 
@@ -119,7 +122,8 @@ from openjiuwen.extensions.observability.semconv import (
     OJ_STREAM_PHASE_FIRST_SEQUENCE,
     OJ_STREAM_PHASE_LAST_SEQUENCE,
     OJ_STREAM_PHASE_OPEN_EVENT,
-    OJ_TRACE_SCHEMA_VERSION,
+    OJ_TRAJECTORY_SCHEMA_VERSION,
+    TRAJECTORY_SPAN_SCHEMA_VERSION,
     OJ_TRAJECTORY_RECORD_KIND,
     OJ_TOOL_AUTHORITATIVE,
     OJ_TOOL_PROTOCOL,
@@ -181,6 +185,10 @@ _PROVIDER_METADATA_ALLOWLIST = frozenset({
     "stop_sequence",
     "incomplete_details",
 })
+# Keyword arguments the runner injects into every tool invocation. They are
+# call context, not model output, so they never belong in
+# ``gen_ai.tool.call.arguments``.
+_INJECTED_TOOL_KWARGS = frozenset({"session", "_tool_callback_context"})
 
 
 def _coerce_message_content(content: Any) -> str:
@@ -376,6 +384,26 @@ class OtelCallbackHandler:
         if self._injected_tracer is not None:
             return self._injected_tracer
         return trace.get_tracer(_TRACER_NAME)
+
+    def context_window_messages(self, messages: Any) -> list[dict[str, Any]]:
+        """Return *messages* in the canonical form a context window commit states.
+
+        The same identity and redaction rules as a model request's commit
+        apply, so a window stated from the context engine directly (after a
+        compaction, say) joins the chain the next request's commit continues:
+        occurrence ids come from each message's ``context_message_id``.
+
+        Args:
+            messages: Context-engine messages, objects or dicts.
+
+        Returns:
+            One canonical trajectory message per input message.
+        """
+        return self._trajectory_messages(
+            messages,
+            occurrence_ids=self._message_occurrence_ids(messages),
+            source_metadata=(),
+        )
 
     @staticmethod
     def _get_parent_context_for_llm_tool() -> Any:
@@ -719,7 +747,7 @@ class OtelCallbackHandler:
                 context=parent_ctx,
             )
             span.set_attribute(GEN_AI_OPERATION_NAME, "execute_tool")
-            span.set_attribute(OJ_TRACE_SCHEMA_VERSION, "1")
+            span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
             span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "tool")
             span.set_attribute(GEN_AI_TOOL_NAME, tool_name)
             if tool_id is not None:
@@ -925,7 +953,7 @@ class OtelCallbackHandler:
             span.set_attribute(OJ_REQUEST_ID, call_id)
         span.set_attribute(OJ_INFERENCE_ID, f"{span.context.span_id:016x}")
         span.set_attribute(GEN_AI_OPERATION_NAME, "chat")
-        span.set_attribute(OJ_TRACE_SCHEMA_VERSION, "1")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "inference")
         span.set_attribute(GEN_AI_REQUEST_STREAM, is_streaming)
         provider_name = self._derive_provider_name(kwargs)
@@ -1145,7 +1173,7 @@ class OtelCallbackHandler:
                     ),
                 )
                 reasoning_span.set_attribute(GEN_AI_OPERATION_NAME, "chat")
-                reasoning_span.set_attribute(OJ_TRACE_SCHEMA_VERSION, "1")
+                reasoning_span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
                 reasoning_span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "reasoning")
                 self._copy_correlation_attributes(state.span, reasoning_span)
                 # Mirror reasoning_tokens onto the reasoning span (also on the
@@ -1181,7 +1209,7 @@ class OtelCallbackHandler:
             span.set_attribute(OJ_REQUEST_ID, state.call_id)
         span.set_attribute(OJ_INFERENCE_ID, f"{span.context.span_id:016x}")
         span.set_attribute(GEN_AI_OPERATION_NAME, "chat")
-        span.set_attribute(OJ_TRACE_SCHEMA_VERSION, "1")
+        span.set_attribute(OJ_TRAJECTORY_SCHEMA_VERSION, TRAJECTORY_SPAN_SCHEMA_VERSION)
         span.set_attribute(OJ_TRAJECTORY_RECORD_KIND, "inference")
         span.set_attribute(GEN_AI_REQUEST_STREAM, state.is_streaming)
 
@@ -1472,7 +1500,7 @@ class OtelCallbackHandler:
             if not explicit and isinstance(metadata, Mapping):
                 explicit = metadata.get("message_id") or metadata.get("openjiuwen.message_id")
             if not explicit and _message_role(message) == "system":
-                explicit = f"openjiuwen:request-system-slot:{system_slot}"
+                explicit = f"{REQUEST_SYSTEM_SLOT_PREFIX}{system_slot}"
                 system_slot += 1
             if explicit:
                 base = str(explicit)
@@ -1890,8 +1918,12 @@ class OtelCallbackHandler:
 
         ``ToolCallEvents.TOOL_CALL_STARTED`` carries ``inputs=(args, kwargs)``
         — a 2-element tuple of positional and keyword arguments from the
-        tool invocation. Preserve the original structure; Session objects
-        are rendered as ``"session:<id>"`` so they remain readable.
+        tool invocation. The model's tool call arguments are the single
+        positional argument the runner passes; keyword arguments are
+        framework-injected call context (session, callback context), not
+        model output, so the attribute records the arguments alone. Session
+        objects still render as ``"session:<id>"`` so they remain readable.
+        Calls that do not fit that shape keep the whole invocation recorded.
         """
         if inputs is None:
             return ""
@@ -1907,6 +1939,21 @@ class OtelCallbackHandler:
                 except Exception:
                     return "<Session>"
             return obj
+
+        invocation = inputs if isinstance(inputs, tuple) and len(inputs) == 2 else None
+        if invocation is not None:
+            args, kwargs = invocation
+            injected = isinstance(kwargs, dict) and all(
+                key in _INJECTED_TOOL_KWARGS for key in kwargs
+            )
+            if injected and len(args) == 1:
+                sanitized = _sanitize(args[0])
+                try:
+                    return json.dumps(sanitized, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    return str(args[0])
+            if injected and len(args) == 0:
+                return "{}"
 
         try:
             sanitized = _sanitize(inputs)

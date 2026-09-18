@@ -275,7 +275,7 @@ provider session/Turn 协议合并。
 
 - **member**（cli-agent 三方团队成员）：`ExternalTeamClient.connect` 建最小 `TeamBackend` +
   `create_team_tools(role="teammate")`，对外暴露**真实** teammate `TeamTool`
-  （`view_task` / `claim_task[claimed|completed]` / `send_message`，结果即 `map_result()`
+  （`view_task` / `claim_task[claimed|completed]` / `send_message`，结果即 `render_for_llm()`
   文本，与进程内成员逐字一致）。入站消息与原生成员同路——父进程 coordination push 进 CLI，
   **不暴露** pull 工具（operator 专有的 `read_inbox` 对 member 不可见）。`complete_task`
   折进 `claim_task(status=completed)`、list/get/claimable 折进 `view_task`。MCP instructions

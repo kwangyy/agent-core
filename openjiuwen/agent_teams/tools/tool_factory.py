@@ -7,7 +7,6 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from openjiuwen.agent_teams.tools.team import TeamBackend
-from openjiuwen.agent_teams.tools.tool_base import MappedToolOutput, TeamTool
 from openjiuwen.agent_teams.tools.tool_async import (
     AsyncTaskCancelTool,
     AsyncTaskOutputTool,
@@ -312,25 +311,21 @@ def create_team_tools(
 
 
 def _wrap_invoke_with_logging(tool: Tool) -> None:
-    """Wrap a tool's invoke method with debug logging and result mapping.
+    """Wrap a tool's invoke method with debug logging.
 
-    For TeamTool instances, the wrapper also calls map_result() to produce
-    a MappedToolOutput whose __str__ returns model-optimized text.
+    The structured result passes through unchanged; the model-facing text is
+    produced later by the tool's own ``render_for_llm``.
     """
     from openjiuwen.core.common.logging import team_logger
 
     original_invoke = tool.invoke
     tool_name = tool.card.name
-    is_team_tool = isinstance(tool, TeamTool)
 
     @wraps(original_invoke)
     async def logged_invoke(inputs: dict[str, Any], **kwargs: Any) -> ToolOutput:
         team_logger.debug(f"[{tool_name}] invoke start, inputs={inputs}")
         result = await original_invoke(inputs, **kwargs)
         team_logger.debug(f"[{tool_name}] invoke end, output={result}")
-        if is_team_tool:
-            mapped = tool.map_result(result)  # type: ignore[union-attr]
-            return MappedToolOutput.from_output(result, mapped)
         return result
 
     tool.invoke = logged_invoke
