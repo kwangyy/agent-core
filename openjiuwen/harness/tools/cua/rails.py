@@ -110,12 +110,6 @@ _FRESHNESS_NEUTRAL_TOOLS = frozenset(
     }
 )
 
-_STALE_SNAPSHOT_ADVISORY = (
-    "Note: this element_index came from a snapshot taken BEFORE you last acted on this window, "
-    "so the element tree may have changed underneath it. Call get_window_state(pid, window_id) "
-    "again and retry with a fresh element_index before trying anything else."
-)
-
 # Set on ctx.extra by CuaSnapshotFreshnessRail.before_tool_call when it strips
 # `query` from a verification snapshot, so after_tool_call can say so.
 _VERIFY_QUERY_DROPPED_EXTRA_KEY = "_cua_verify_query_dropped"
@@ -146,20 +140,6 @@ _SNAPSHOT_VOLATILE_FIELD_RE = re.compile(
 # the field normalization, consecutive idle-window MCP texts are identical.
 _SNAPSHOT_IMAGE_PLACEHOLDER_RE = re.compile(r"\[image content: [^\]]{0,80}\]")
 
-_SNAPSHOT_UNCHANGED_NOTE = (
-    _DRIVER_SUCCESS_MARKER + " Unchanged: this {tool} snapshot of pid={pid}, window_id={window_id} "
-    "matches your previous one ({chars} chars elided; only volatile fields differ: screenshot "
-    "bytes, snapshot_id, element_token values). The element tree and every element_index from "
-    "that snapshot are still valid; address elements by element_index, not element_token."
-)
-
-_SELF_CHANGED_WINDOW_NOTE = (
-    "Note: this window's tree changed since your previous snapshot even though you performed no "
-    "action in between -- the app updates its own UI (loading, animation, async content). "
-    "Re-snapshot immediately before element actions on this window; element_index values here "
-    "can go stale on their own."
-)
-
 _REPEAT_BLOCKED = (
     "Blocked: this exact call has already returned the same non-success response {count} times "
     "in this run and is not being sent again. The approach is not working — re-snapshot with "
@@ -167,10 +147,15 @@ _REPEAT_BLOCKED = (
     "blocked. Repeating this call verbatim will stay blocked."
 )
 
-# CuaProgressRail thresholds -- unlike every other threshold in this file,
-# these are NOT corpus-validated yet: no recorded cua run traces exist for
-# the state-revisit signal. Treat as a reasonable starting point, not a
-# measured constant, until real runs can confirm or retune it.
+# CuaProgressRail thresholds. Precision checked against the 96 cua_bench
+# runs recorded 2026-09-15 (examples/cua/bench_results): the advisory fired
+# 3 times, every one in a notepad_type run that was cycling on the save
+# flow (re-snapshotting the unchanged editor window after Ctrl+S) and ended
+# hard-blocked or at the 25-call cap; it never fired in a run that finished
+# cleanly. Recall is NOT measured: 7 of the 9 capped-out runs got no
+# advisory, and the bench logs keep no snapshot text to replay, so whether
+# they cycled through identical states is unknown. cua_bench now records
+# revisit_count per run; retune from that, not from this comment.
 _STATE_REVISIT_ADVISE_AFTER = 3
 _STATE_REVISIT_HISTORY_SIZE = 8
 _CUA_BLOCKER_NOTE_MAX = 200
@@ -346,16 +331,6 @@ def _append_advisory(inputs: ToolCallInputs, advisory: str) -> None:
     tool_msg = inputs.tool_msg
     if tool_msg is not None and isinstance(getattr(tool_msg, "content", None), str):
         tool_msg.content += suffix
-
-
-def _set_content(inputs: ToolCallInputs, text: str) -> None:
-    """Replace a tool result's text in place (both stores, str content only)."""
-    data = getattr(inputs.tool_result, "data", None)
-    if isinstance(data, dict) and isinstance(data.get("content"), str):
-        data["content"] = text
-    tool_msg = inputs.tool_msg
-    if tool_msg is not None and isinstance(getattr(tool_msg, "content", None), str):
-        tool_msg.content = text
 
 
 class CuaDeliveryModeRail(AgentRail):
@@ -694,36 +669,26 @@ class CuaScreenshotDownscaleRail(AgentRail):
 
 
 class CuaSnapshotFreshnessRail(AgentRail):
-    """Attach a re-snapshot hint when a stale-window element action fails.
+    """Keep verification snapshots unfiltered.
 
-    The driver scopes the element_index cache per (pid, window_id) and replaces
-    it on every snapshot, and the agent prompt says to re-snapshot before every
-    element action -- but the recorded corpus shows the rule is routinely and
-    successfully broken: 357 element actions issued after the window was acted
-    on succeeded (Windows trees are stable across consecutive clicks), while 70
-    failed. A hard browser-style generation gate would therefore block far more
-    legitimate work than it saved, and the driver already rejects truly stale
-    element_tokens with its own actionable message.
+    The rail tracks, per (pid, window_id), whether the window has been acted on
+    since its last snapshot, and uses that one bit to drive one rewrite:
+    ``query`` is dropped from the first snapshot after an action on that
+    window. That snapshot is the verification of the action, and a filter can
+    hide the very evidence being checked (bench-observed: a verify filtered to
+    the clicked item's name hid the "1 item selected" status bar, read as
+    failure, and spiralled into a 20-step recovery; a verify filtered to
+    "About" needed four more filtered snapshots to find what one unfiltered
+    tree showed). Telling the model in the prompt not to filter verification
+    snapshots did not change its behaviour, so the rail does it and says so in
+    the result. Discovery snapshots -- a window not acted on since its last
+    snapshot -- keep their query.
 
-    So this rail never blocks. It tracks, per (pid, window_id), whether the
-    window has been acted on since its last snapshot, and when an
-    element-indexed action on such a dirty window comes back without the driver
-    success marker, it appends the one hint that resolves the likeliest cause:
-    re-snapshot and re-index. The 70 corpus failures would each have carried
-    the hint on their first failure instead of waiting for the repeat-failure
-    advisory at three.
-
-    The same dirty-window state drives one rewrite: ``query`` is dropped from
-    the first snapshot after an action on that window. That snapshot is the
-    verification of the action, and a filter can hide the very evidence being
-    checked (bench-observed: a verify filtered to the clicked item's name hid
-    the "1 item selected" status bar, read as failure, and spiralled into a
-    20-step recovery; a verify filtered to "About" needed four more filtered
-    snapshots to find what one unfiltered tree showed). Telling the model in
-    the prompt not to filter verification snapshots did not change its
-    behaviour, so the rail does it and says so in the result. Discovery
-    snapshots -- a window not acted on since its last snapshot -- keep their
-    query.
+    The rail never blocks. It also used to append a re-snapshot hint when an
+    element action failed on a window acted on since its last snapshot; that
+    was dropped because the driver already rejects truly stale element_tokens
+    with its own actionable message, and the hint needed two chained actions on
+    one window before it could fire at all.
     """
 
     def __init__(self, mcp_cfg: McpServerConfig) -> None:
@@ -782,151 +747,7 @@ class CuaSnapshotFreshnessRail(AgentRail):
         if short_name in _FRESHNESS_NEUTRAL_TOOLS:
             return
 
-        was_fresh = self._fresh.get(key, False)
         self._fresh[key] = False
-        if args.get("element_index") is None or was_fresh:
-            return
-        response = _response_text(inputs)
-        if response is None or response.startswith(_DRIVER_SUCCESS_MARKER):
-            return
-        if "get_window_state" in response:
-            # The driver (or another rail) already told the model to re-snapshot.
-            return
-        logger.info(
-            "[CuaSnapshotFreshnessRail] %s failed on a window acted on since its last snapshot",
-            tool_name,
-        )
-        _append_advisory(inputs, _STALE_SNAPSHOT_ADVISORY)
-
-
-class CuaSnapshotDedupRail(AgentRail):
-    """Collapse byte-identical repeat snapshots; flag windows that change by themselves.
-
-    A perceive-act-verify loop re-reads the same window constantly, and Windows
-    element trees are stable, so consecutive ``get_window_state`` calls often
-    return the exact same payload -- each a full element tree that the
-    ToolResultWindowProcessor keeps verbatim while it is inside the retention
-    window. When a snapshot's text matches the previous snapshot of the same
-    (tool, pid, window_id) -- compared after stripping the fields the driver
-    regenerates every call (screenshot bytes, snapshot_id), which otherwise
-    make every payload unique -- this rail replaces it with a one-line
-    "unchanged" note: the driver has still refreshed its element cache, so the
-    indices from the retained earlier copy stay valid.
-
-    At most ``keep_last_k - 1`` consecutive snapshots are collapsed per key:
-    the window processor keeps only the newest ``keep_last_k`` snapshot results
-    in full, so a longer run of notes could push every full copy of the tree
-    out of context. With ``keep_last_k=1`` the rail never collapses anything.
-
-    The same digest comparison detects the opposite case for free: a snapshot
-    that DIFFERS from the previous one although no cua action ran in between
-    means the app mutates its own UI (loading screens, async content). That is
-    exactly the dynamic case the action-based CuaSnapshotFreshnessRail cannot
-    see, so the first such change per window gets a warning that element
-    indices there go stale on their own.
-    """
-
-    def __init__(self, mcp_cfg: McpServerConfig, *, keep_last_k: int = 3) -> None:
-        super().__init__()
-        if not isinstance(keep_last_k, int) or isinstance(keep_last_k, bool) or keep_last_k < 1:
-            raise ValueError(f"keep_last_k must be an int >= 1, got {keep_last_k!r}")
-        self._tool_prefix = mcp_model_tool_prefix(mcp_cfg.server_name)
-        self._max_consecutive = keep_last_k - 1
-        # (short_name, pid, window_id) -> (digest of last driver payload, action count when taken)
-        self._last: dict = {}
-        # (short_name, pid, window_id) -> consecutive snapshots collapsed so far
-        self._collapsed: dict = {}
-        self._self_change_noted: set = set()
-        self._action_count = 0
-
-    async def before_invoke(self, ctx: AgentCallbackContext) -> None:
-        self._last.clear()
-        self._collapsed.clear()
-        self._self_change_noted.clear()
-        self._action_count = 0
-
-    async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
-        inputs = ctx.inputs
-        if not isinstance(inputs, ToolCallInputs):
-            return
-        tool_name = str(inputs.tool_name or "")
-        if not tool_name.startswith(self._tool_prefix):
-            return
-        if ctx.extra.get("_skip_tool"):
-            # A rail-side rejection never reached the driver.
-            return
-        short_name = tool_name[len(self._tool_prefix) :]
-        if short_name in _FRESHNESS_NEUTRAL_TOOLS:
-            return
-        args, _ = _normalize_tool_args(inputs.tool_args)
-        if args is None:
-            return
-        if short_name not in _SNAPSHOT_TOOLS:
-            self._action_count += 1
-            return
-
-        key = (short_name, args.get("pid"), args.get("window_id"))
-        response = _response_text(inputs)
-        # Snapshot payloads do NOT carry the driver's action-success marker --
-        # a real get_window_state text starts with a plain header line
-        # ("window_id=... pid=... elements=32"). The usable-baseline gate is
-        # therefore the presence of tree content, which driver error texts
-        # ("window not found", stale-token rejections) never contain. This
-        # also keeps identical *errors* from being collapsed into a note that
-        # would wrongly claim the tree is intact.
-        if (
-            response is None
-            or ("element_index" not in response and "element_count" not in response)
-            or not isinstance(getattr(inputs.tool_msg, "content", None), str)
-        ):
-            # A failed (or non-textual) snapshot leaves no baseline to compare
-            # against; the next success must go through in full.
-            self._last.pop(key, None)
-            self._collapsed.pop(key, None)
-            return
-
-        comparable = _SNAPSHOT_VOLATILE_FIELD_RE.sub(r"\1<volatile>", response)
-        comparable = _SNAPSHOT_IMAGE_PLACEHOLDER_RE.sub("[image content: <volatile>]", comparable)
-        digest = hashlib.sha256(comparable.encode("utf-8")).hexdigest()
-        previous = self._last.get(key)
-        self._last[key] = (digest, self._action_count)
-
-        if previous is not None and previous[0] == digest:
-            if self._collapsed.get(key, 0) >= self._max_consecutive:
-                # Let a full copy through so the tree stays reachable inside
-                # the window processor's keep_last_k retention.
-                self._collapsed[key] = 0
-                return
-            self._collapsed[key] = self._collapsed.get(key, 0) + 1
-            logger.info(
-                "[CuaSnapshotDedupRail] Collapsed identical %s (%d chars) for pid=%r window_id=%r",
-                short_name,
-                len(response),
-                args.get("pid"),
-                args.get("window_id"),
-            )
-            _set_content(
-                inputs,
-                _SNAPSHOT_UNCHANGED_NOTE.format(
-                    tool=short_name,
-                    pid=args.get("pid"),
-                    window_id=args.get("window_id"),
-                    chars=len(response),
-                ),
-            )
-            return
-
-        self._collapsed[key] = 0
-        if previous is not None and previous[1] == self._action_count and key not in self._self_change_noted:
-            # The tree moved although the agent did nothing: self-mutating UI.
-            self._self_change_noted.add(key)
-            logger.info(
-                "[CuaSnapshotDedupRail] %s changed without any cua action for pid=%r window_id=%r",
-                short_name,
-                args.get("pid"),
-                args.get("window_id"),
-            )
-            _append_advisory(inputs, _SELF_CHANGED_WINDOW_NOTE)
 
 
 class CuaElementAddressingRail(AgentRail):
@@ -1098,26 +919,17 @@ class CuaRepeatFailureRail(AgentRail):
 class CuaProgressRail(AgentRail):
     """Track coarse desktop-state revisits and surface a resume_context to the caller.
 
-    Two signals, both provisional -- unlike every other rail in this file,
-    no recorded cua run corpus validates these thresholds yet:
+    Two signals, both provisional -- the revisit threshold has measured
+    precision but no measured recall (see the constants above):
 
-    1. State-revisit loop detection. CuaSnapshotDedupRail already collapses
-       a snapshot that is byte-identical to the IMMEDIATELY PRECEDING one of
-       the same window. That misses cycling back to a state seen several
-       actions ago (dialog A -> dialog B -> dialog A), where the
-       intervening snapshot(s) differ so nothing collapses. This rail keeps
-       a short bounded history of content digests per (pid, window_id) --
-       normalized the same way CuaSnapshotDedupRail is, by stripping the
-       fields the driver regenerates every call -- and appends a replan
-       advisory once a digest reappears often enough.
-
-       Must run BEFORE CuaSnapshotDedupRail in the rail list (enforced by
-       injection order in create_cua_agent(), not priority -- this file's
-       cua rails all use the default priority) so it always sees the
-       driver's raw response text. After dedup collapses a repeat into its
-       short "unchanged" note, that note's digest would no longer match the
-       original content's digest and revisits would silently stop being
-       tracked.
+    1. State-revisit loop detection. A window that cycles back to a state
+       seen several actions ago (dialog A -> dialog B -> dialog A) is
+       repeating itself without ever repeating its immediately preceding
+       snapshot. This rail keeps a short bounded history of content digests
+       per (pid, window_id) -- normalized by stripping the fields the driver
+       regenerates on every call (screenshot bytes, snapshot_id,
+       element_token values) -- and appends a replan advisory once a digest
+       reappears often enough.
 
     2. resume_context reporting. At run end (after_invoke) this rail
        packages what it tracked -- current window, accumulated blockers,
@@ -1179,8 +991,8 @@ class CuaProgressRail(AgentRail):
             pid, window_id = args.get("pid"), args.get("window_id")
             if pid is not None or window_id is not None:
                 self._current_window = {"pid": pid, "window_id": window_id}
-            # Same usable-baseline gate as CuaSnapshotDedupRail: a failed or
-            # non-textual snapshot carries no tree content to fingerprint.
+            # A failed or non-textual snapshot ("window not found", a stale
+            # token rejection) carries no tree content to fingerprint.
             if response and ("element_index" in response or "element_count" in response):
                 self._track_revisit(inputs, short_name, pid, window_id, response)
             return
@@ -1286,6 +1098,5 @@ __all__ = [
     "CuaRepeatFailureRail",
     "CuaRuntimeRail",
     "CuaScreenshotDownscaleRail",
-    "CuaSnapshotDedupRail",
     "CuaSnapshotFreshnessRail",
 ]

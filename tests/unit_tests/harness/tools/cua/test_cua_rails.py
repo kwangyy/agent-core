@@ -20,7 +20,6 @@ from openjiuwen.harness.tools.cua.rails import (
     CuaRepeatFailureRail,
     CuaRuntimeRail,
     CuaScreenshotDownscaleRail,
-    CuaSnapshotDedupRail,
     CuaSnapshotFreshnessRail,
     CuaUserTakeoverRail,
 )
@@ -1019,9 +1018,6 @@ def test_invalid_thresholds_fail_at_construction() -> None:
 # ---------------------------------------------------------------------------
 
 
-_ELEMENT_FAILURE = "Element 7 did not respond to Invoke."
-
-
 async def _observe(rail, tool_short, args, content):
     """Feed one completed cua driver call through the freshness rail."""
     ctx = _result_ctx("mcp_cua-driver_" + tool_short, dict(args), content)
@@ -1029,55 +1025,7 @@ async def _observe(rail, tool_short, args, content):
     return ctx
 
 
-@pytest.mark.asyncio
-async def test_failed_element_action_on_a_stale_window_gets_a_resnapshot_hint() -> None:
-    # The corpus shows 70 element actions failing after the window had been
-    # acted on since its snapshot; each waited for the repeat-failure advisory
-    # (3 identical failures) before being told to re-snapshot. The hint on the
-    # FIRST such failure names the likeliest cause immediately.
-    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    first = await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
-    second = await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
-
-    # Right after a snapshot the index is legitimately fresh: a failure there
-    # is NOT a staleness problem, so no hint.
-    assert "snapshot taken BEFORE" not in first.inputs.tool_msg.content
-    # The first click dirtied the window; the next failure carries the hint.
-    assert "snapshot taken BEFORE" in second.inputs.tool_msg.content
-    assert "get_window_state" in second.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_successful_element_actions_are_never_annotated() -> None:
-    # 357 corpus element actions on acted-on windows SUCCEEDED (Windows trees
-    # are stable across consecutive clicks) -- which is exactly why this rail
-    # must never block and must never nag on success.
-    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    ctxs = [await _observe(rail, "click", {**win, "element_index": i}, "\u2705 clicked") for i in (7, 8, 9, 10)]
-
-    assert all("snapshot taken BEFORE" not in c.inputs.tool_msg.content for c in ctxs)
-
-
-@pytest.mark.asyncio
-async def test_a_fresh_snapshot_clears_the_stale_state() -> None:
-    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    after = await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
-
-    assert "snapshot taken BEFORE" not in after.inputs.tool_msg.content
-
-
-async def _snapshot_round_trip(rail, args, content: str = "\u2705 tree"):
+async def _snapshot_round_trip(rail, args, content: str = "✅ tree"):
     """One snapshot through both hooks, as the runtime drives them."""
     ctx = _result_ctx("mcp_cua-driver_get_window_state", args, content)
     await rail.before_tool_call(ctx)
@@ -1095,8 +1043,8 @@ async def test_query_is_dropped_from_the_first_snapshot_after_an_action() -> Non
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
     win = {"pid": 1, "window_id": 2}
 
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    await _observe(rail, "click", {**win, "element_index": 7}, "\u2705 clicked")
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
     verify = await _snapshot_round_trip(rail, {**win, "query": "bench_item_07", "max_elements": 200})
 
     assert "query" not in verify.inputs.tool_args
@@ -1125,8 +1073,8 @@ async def test_dropped_query_is_written_back_in_the_json_shape_it_arrived_in() -
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
     win = {"pid": 1, "window_id": 2}
 
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    await _observe(rail, "type_text", {**win, "element_index": 0, "text": "x"}, "\u2705 typed")
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "type_text", {**win, "element_index": 0, "text": "x"}, "✅ typed")
     verify = await _snapshot_round_trip(rail, json.dumps({**win, "query": "Unmodified"}))
 
     assert isinstance(verify.inputs.tool_args, str)
@@ -1135,315 +1083,74 @@ async def test_dropped_query_is_written_back_in_the_json_shape_it_arrived_in() -
 
 
 @pytest.mark.asyncio
-async def test_an_unsnapshotted_window_counts_as_stale() -> None:
-    # An element_index with no snapshot at all is the same mistake in a worse
-    # form; the driver rejects it and the hint tells the model the way out.
+async def test_a_snapshot_re_freshens_the_window_so_the_next_query_survives() -> None:
+    # The drop is scoped to the FIRST snapshot after an action, because that is
+    # the one verifying the action. Once it has been taken the window is fresh
+    # again and a follow-up filtered read is discovery, not verification.
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
 
-    ctx = await _observe(rail, "click", {"pid": 1, "window_id": 9, "element_index": 3}, _ELEMENT_FAILURE)
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
+    verify = await _snapshot_round_trip(rail, {**win, "query": "Saved"})
+    follow_up = await _snapshot_round_trip(rail, {**win, "query": "Saved"})
 
-    assert "snapshot taken BEFORE" in ctx.inputs.tool_msg.content
+    assert "query" not in verify.inputs.tool_args
+    assert follow_up.inputs.tool_args["query"] == "Saved"
 
 
 @pytest.mark.asyncio
-async def test_read_only_observers_do_not_mark_the_window_stale() -> None:
+async def test_read_only_observers_do_not_dirty_the_window() -> None:
     # zoom / list_windows / get_desktop_state neither mutate the window nor
-    # replace the element cache, so they must not cost the model its fresh
-    # snapshot.
+    # replace the element cache, so they must not cost the model its filter.
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
     win = {"pid": 1, "window_id": 2}
 
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
-    await _observe(rail, "zoom", win, "\u2705 zoomed")
-    await _observe(rail, "list_windows", {}, "\u2705 windows")
-    ctx = await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "zoom", win, "✅ zoomed")
+    await _observe(rail, "list_windows", {}, "✅ windows")
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
 
-    assert "snapshot taken BEFORE" not in ctx.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_the_drivers_own_resnapshot_message_is_not_doubled() -> None:
-    # The driver already rejects truly stale element_tokens with "call
-    # get_window_state again to refresh"; appending the same advice twice
-    # teaches the model to skim advisories.
-    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _observe(rail, "click", {**win, "element_index": 1}, "boom")
-    ctx = await _observe(
-        rail,
-        "click",
-        {**win, "element_index": 7},
-        "element_token is stale; call get_window_state again to refresh",
-    )
-
-    assert "snapshot taken BEFORE" not in ctx.inputs.tool_msg.content
+    assert ctx.inputs.tool_args["query"] == "Save"
 
 
 @pytest.mark.asyncio
 async def test_windows_are_tracked_independently() -> None:
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
 
-    await _observe(rail, "get_window_state", {"pid": 1, "window_id": 2}, "\u2705 tree")
-    await _observe(rail, "click", {"pid": 3, "window_id": 4, "element_index": 1}, "\u2705 ok")
-    ctx = await _observe(rail, "click", {"pid": 1, "window_id": 2, "element_index": 7}, _ELEMENT_FAILURE)
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {"pid": 3, "window_id": 4, "element_index": 1}, "✅ ok")
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
 
-    # Acting on window (3,4) does not invalidate (1,2)'s snapshot.
-    assert "snapshot taken BEFORE" not in ctx.inputs.tool_msg.content
+    # Acting on window (3,4) does not turn (1,2)'s next snapshot into a verify.
+    assert ctx.inputs.tool_args["query"] == "Save"
 
 
 @pytest.mark.asyncio
 async def test_freshness_resets_between_invokes() -> None:
+    # A new invoke starts with no window history at all, so the first filtered
+    # snapshot of any window is discovery again.
     rail = CuaSnapshotFreshnessRail(_mcp_cfg())
     win = {"pid": 1, "window_id": 2}
 
-    await _observe(rail, "get_window_state", win, "\u2705 tree")
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
     await rail.before_invoke(_ctx())
-    ctx = await _observe(rail, "click", {**win, "element_index": 7}, _ELEMENT_FAILURE)
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
 
-    # The previous invoke's snapshot is gone with its element cache.
-    assert "snapshot taken BEFORE" in ctx.inputs.tool_msg.content
-
-
-# ---------------------------------------------------------------------------
-# CuaSnapshotDedupRail
-# ---------------------------------------------------------------------------
+    assert ctx.inputs.tool_args["query"] == "Save"
 
 
-_TREE_A = "\u2705 Window state\n[element_index 1] Button '7'\n[element_index 2] Button '8'"
-_TREE_B = "\u2705 Window state\n[element_index 1] Button '7'\n[element_index 2] Button '9'"
+# --- CuaProgressRail ---------------------------------------------------
 
 
 async def _snap(rail, tool_short, args, content):
-    """Feed one completed cua driver call through the dedup rail."""
+    """Feed one completed cua driver call through the rail under test."""
     ctx = _result_ctx("mcp_cua-driver_" + tool_short, dict(args), content)
     await rail.after_tool_call(ctx)
     return ctx
 
-
-@pytest.mark.asyncio
-async def test_an_identical_repeat_snapshot_is_collapsed_to_an_unchanged_note() -> None:
-    # A verify loop re-reads the same stable window; the second identical tree
-    # buys no information, so only a success-marked one-liner should reach
-    # context (the driver still refreshed its element cache, so the retained
-    # first copy keeps its valid indices).
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    first = await _snap(rail, "get_window_state", win, _TREE_A)
-    second = await _snap(rail, "get_window_state", win, _TREE_A)
-
-    assert first.inputs.tool_msg.content == _TREE_A
-    note = second.inputs.tool_msg.content
-    assert note.startswith("\u2705") and "Unchanged" in note
-    assert "[element_index" not in note
-    assert second.inputs.tool_result.data["content"] == note
-
-
-@pytest.mark.asyncio
-async def test_collapse_is_capped_below_the_context_retention_window() -> None:
-    # The window processor keeps the newest keep_last_k snapshot results in
-    # full; a run of notes longer than keep_last_k - 1 could evict every full
-    # copy of the tree from context, so the cap lets one through periodically.
-    rail = CuaSnapshotDedupRail(_mcp_cfg(), keep_last_k=3)
-    win = {"pid": 1, "window_id": 2}
-
-    ctxs = [await _snap(rail, "get_window_state", win, _TREE_A) for _ in range(5)]
-
-    collapsed = ["Unchanged" in c.inputs.tool_msg.content for c in ctxs]
-    assert collapsed == [False, True, True, False, True]
-
-
-@pytest.mark.asyncio
-async def test_keep_last_k_of_one_disables_collapsing() -> None:
-    # With a single-slot window a note would BE the only retained snapshot,
-    # leaving the model with no tree at all.
-    rail = CuaSnapshotDedupRail(_mcp_cfg(), keep_last_k=1)
-    win = {"pid": 1, "window_id": 2}
-
-    ctxs = [await _snap(rail, "get_window_state", win, _TREE_A) for _ in range(3)]
-
-    assert all(c.inputs.tool_msg.content == _TREE_A for c in ctxs)
-
-
-@pytest.mark.asyncio
-async def test_a_changed_tree_is_never_collapsed() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await _snap(rail, "click", {**win, "element_index": 2}, "\u2705 clicked")
-    changed = await _snap(rail, "get_window_state", win, _TREE_B)
-
-    assert changed.inputs.tool_msg.content == _TREE_B
-
-
-@pytest.mark.asyncio
-async def test_a_failed_snapshot_clears_the_baseline() -> None:
-    # The failure delivered no tree, so eliding the next success against the
-    # pre-failure baseline would leave the model with nothing to act on.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await _snap(rail, "get_window_state", win, "window not found")
-    recovered = await _snap(rail, "get_window_state", win, _TREE_A)
-
-    assert recovered.inputs.tool_msg.content == _TREE_A
-
-
-@pytest.mark.asyncio
-async def test_windows_are_deduped_independently() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-
-    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _TREE_A)
-    other = await _snap(rail, "get_window_state", {"pid": 3, "window_id": 4}, _TREE_A)
-
-    # Same bytes, different window: not a repeat of anything.
-    assert other.inputs.tool_msg.content == _TREE_A
-
-
-@pytest.mark.asyncio
-async def test_collapse_survives_interleaved_actions_when_the_tree_is_stable() -> None:
-    # Windows trees are stable across consecutive clicks (357 recorded
-    # successes); if the re-read after an action comes back byte-identical,
-    # it is still redundant.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await _snap(rail, "click", {**win, "element_index": 1}, "\u2705 clicked")
-    reread = await _snap(rail, "get_window_state", win, _TREE_A)
-
-    assert "Unchanged" in reread.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_a_window_that_changes_without_any_action_is_flagged_dynamic() -> None:
-    # The action-based freshness rail cannot see an app that mutates its own
-    # UI; the digest comparison can, and warns exactly once per window.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    changed = await _snap(rail, "get_window_state", win, _TREE_B)
-    changed_again = await _snap(rail, "get_window_state", win, _TREE_A)
-
-    note = changed.inputs.tool_msg.content
-    assert note.startswith(_TREE_B)  # the tree itself is retained
-    assert "changed since your previous snapshot" in note
-    assert "changed since your previous snapshot" not in changed_again.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_no_dynamic_flag_when_the_agent_acted_in_between() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await _snap(rail, "click", {**win, "element_index": 1}, "\u2705 clicked")
-    changed = await _snap(rail, "get_window_state", win, _TREE_B)
-
-    # The agent's own click explains the change; no dynamic-UI warning.
-    assert "changed since your previous snapshot" not in changed.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_read_only_observers_do_not_mask_the_dynamic_flag() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await _snap(rail, "zoom", win, "\u2705 zoomed")
-    await _snap(rail, "list_windows", {}, "\u2705 windows")
-    changed = await _snap(rail, "get_window_state", win, _TREE_B)
-
-    # zoom / list_windows cannot have changed the window.
-    assert "changed since your previous snapshot" in changed.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_dedup_state_resets_between_invokes() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-
-    await _snap(rail, "get_window_state", win, _TREE_A)
-    await rail.before_invoke(_ctx())
-    fresh = await _snap(rail, "get_window_state", win, _TREE_A)
-
-    # A new conversation starts from an empty context: the previous invoke's
-    # retained copy is gone, so nothing may be elided against it.
-    assert fresh.inputs.tool_msg.content == _TREE_A
-
-
-@pytest.mark.asyncio
-async def test_volatile_snapshot_fields_do_not_defeat_the_dedup() -> None:
-    # The driver stamps every snapshot with fresh screenshot bytes and a
-    # monotonic snapshot_id even when the tree is untouched (verified by
-    # diffing two consecutive live payloads) -- raw byte comparison would
-    # therefore never fire at all.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-    body = (
-        '"element_token": "{sid}:0", "element_index": 0,\n'
-        + '"snapshot_id": "{sid}",\n"screenshot_png_b64": "{png}",\n'
-        + _TREE_A[2:]
-    )
-
-    await _snap(rail, "get_window_state", win, "\u2705 " + body.format(sid="s0012", png="AAAB"))
-    second = await _snap(rail, "get_window_state", win, "\u2705 " + body.format(sid="s0013", png="AACD"))
-
-    assert "Unchanged" in second.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_a_real_tree_change_still_defeats_the_normalized_dedup() -> None:
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-    body = '"snapshot_id": "{sid}",\n' + "{tree}"
-
-    await _snap(rail, "get_window_state", win, "\u2705 " + body.format(sid="s0012", tree=_TREE_A))
-    changed = await _snap(rail, "get_window_state", win, "\u2705 " + body.format(sid="s0013", tree=_TREE_B))
-
-    assert "Unchanged" not in changed.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_the_screenshot_placeholder_length_does_not_defeat_the_dedup() -> None:
-    # The MCP bridge renders the screenshot block as '[image content:
-    # image/png, NNNNN base64 chars]' and the length changes every capture
-    # (encoder noise), so it must not count as a tree change.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 1, "window_id": 2}
-    body = _TREE_A + " [image content: image/png, {n} base64 chars]"
-
-    await _snap(rail, "get_window_state", win, body.format(n=51439))
-    second = await _snap(rail, "get_window_state", win, body.format(n=51163))
-
-    assert "Unchanged" in second.inputs.tool_msg.content
-
-
-@pytest.mark.asyncio
-async def test_real_snapshot_payloads_carry_no_success_marker_and_still_collapse() -> None:
-    # A real get_window_state text begins with a plain header line, NOT the
-    # driver's action-success marker (that convention is for input actions).
-    # Gating the baseline on the marker silently disabled the dedup in live
-    # runs; the gate is tree content instead.
-    rail = CuaSnapshotDedupRail(_mcp_cfg())
-    win = {"pid": 8276, "window_id": 16192158}
-    body = (
-        "window_id=16192158 pid=8276 elements=32 [element_index 0] Document"
-        + " "
-        + "[image content: image/png, {n} base64 chars]"
-    )
-
-    await _snap(rail, "get_window_state", win, body.format(n=51439))
-    second = await _snap(rail, "get_window_state", win, body.format(n=51163))
-
-    assert "Unchanged" in second.inputs.tool_msg.content
-
-
-# --- CuaProgressRail ---------------------------------------------------
 
 _WIN_A = "\u2705 Window state\n[element_index 1] Button 'A'\n[element_index 2] Button 'B'"
 _WIN_B = "\u2705 Window state\n[element_index 1] Button 'C'\n[element_index 2] Button 'D'"
@@ -1487,10 +1194,10 @@ async def test_revisit_advisory_fires_after_the_configured_threshold() -> None:
 
 @pytest.mark.asyncio
 async def test_revisit_detection_survives_a_different_intervening_state() -> None:
-    # The gap this rail closes: CuaSnapshotDedupRail only ever compares a
-    # snapshot to the one immediately before it, so A -> B -> A never
-    # collapses (A != B each time). This rail keeps a short history per
-    # window, so the THIRD visit to A is still caught even with B in between.
+    # The gap this rail closes: comparing a snapshot only to the one
+    # immediately before it never catches A -> B -> A (A != B each time).
+    # This rail keeps a short history per window, so the THIRD visit to A is
+    # still caught even with B in between.
     rail = CuaProgressRail(_mcp_cfg())
     win = {"pid": 1, "window_id": 2}
 

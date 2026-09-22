@@ -37,7 +37,6 @@ from openjiuwen.harness.tools.cua.rails import (
     CuaRepeatFailureRail,
     CuaRuntimeRail,
     CuaScreenshotDownscaleRail,
-    CuaSnapshotDedupRail,
     CuaSnapshotFreshnessRail,
     CuaUserTakeoverRail,
 )
@@ -415,7 +414,6 @@ def test_driver_contract_rails_are_installed_unconditionally() -> None:
     assert any(isinstance(r, CuaElementAddressingRail) for r in agent._pending_rails)
     assert any(isinstance(r, CuaRepeatFailureRail) for r in agent._pending_rails)
     assert any(isinstance(r, CuaSnapshotFreshnessRail) for r in agent._pending_rails)
-    assert any(isinstance(r, CuaSnapshotDedupRail) for r in agent._pending_rails)
 
 
 @pytest.mark.parametrize(
@@ -486,16 +484,6 @@ def test_superseded_snapshots_keep_only_a_short_inline_preview() -> None:
     context_rails = [rail for rail in agent._pending_rails if isinstance(rail, ContextProcessorRail)]
     _, cfg = context_rails[0]._user_processors[0]
     assert cfg.trim_size == 200
-
-
-def test_snapshot_dedup_rail_rides_the_retention_knob() -> None:
-    agent = create_cua_agent(_create_dummy_model(), language="en", cua_snapshot_keep_last_k=2)
-
-    dedup_rails = [r for r in agent._pending_rails if isinstance(r, CuaSnapshotDedupRail)]
-    assert len(dedup_rails) == 1
-    # One below the window processor's retention, so a full tree always stays
-    # reachable in context.
-    assert dedup_rails[0]._max_consecutive == 1
 
 
 def test_build_cua_agent_config_forwards_permissions_and_host_to_the_factory() -> None:
