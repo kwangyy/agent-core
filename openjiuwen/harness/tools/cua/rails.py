@@ -81,6 +81,15 @@ _BACKGROUND_ONLY_REJECTION = (
 # only unmarked high-repeat call is a genuine stuck loop.
 _DRIVER_SUCCESS_MARKER = "✅"
 
+# Driver-side failure marker: a call the driver could not carry out (target
+# gone, argument rejected, value did not stick). A reply with neither marker
+# is an action that ran but could not be verified. The two are counted alike
+# by CuaRepeatFailureRail (a loop of unverified repeats is still a loop) but
+# only a marked failure is a blocker for CuaProgressRail: an OSWorld bridge
+# run (task 052, 2026-09-22) had 86 unverified clicks and 1 failure, and
+# listing all 87 as blockers said nothing about what actually went wrong.
+_DRIVER_FAILURE_MARKER = "❌"
+
 # Volatile argument keys excluded from the repeat-identity of a call: they
 # change between runs without changing what the call does.
 _REPEAT_IDENTITY_IGNORED_ARGS = frozenset({"session"})
@@ -999,10 +1008,9 @@ class CuaProgressRail(AgentRail):
         if short_name in _FRESHNESS_NEUTRAL_TOOLS:
             return
 
-        # Action tool: absence of the driver success marker signals a blocker.
-        # (Snapshot/freshness-neutral tools never carry the marker even on
-        # success, which is why they are excluded above rather than checked.)
-        if response is not None and not response.startswith(_DRIVER_SUCCESS_MARKER):
+        # Action tool: the driver's failure marker signals a blocker. An
+        # unmarked reply is an unverified action, not a failure.
+        if response is not None and response.startswith(_DRIVER_FAILURE_MARKER):
             self._note_blocker(short_name, response)
 
     def _track_revisit(

@@ -863,7 +863,8 @@ async def test_non_cua_tools_are_left_alone() -> None:
 # ---------------------------------------------------------------------------
 
 
-_FAILURE = "Pass either element_index (ax) or x,y (px) to type_text, not both."
+_FAILURE = "❌ Pass either element_index (ax) or x,y (px) to type_text, not both."
+_UNVERIFIED = "Sent tab via PostMessage to pid 44452 (not verified)."
 _SUCCESS = "\u2705 Sent tab via SendInput on pid 44452 (delivery_mode:foreground)."
 
 
@@ -1246,6 +1247,21 @@ async def test_blockers_accumulate_for_non_success_action_responses() -> None:
     await rail.after_invoke(_after_invoke_ctx(result))
 
     assert result["cua_result"]["blockers"] == [f"type_text: {_FAILURE}"]
+
+
+@pytest.mark.asyncio
+async def test_unverified_action_responses_are_not_blockers() -> None:
+    # No ✅ and no ❌: the action ran but the driver could not verify it.
+    # That is not a failure to report to a parent; only the failure marker is.
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_press_key", {"pid": 1, "key": "tab"}, _UNVERIFIED))
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == []
 
 
 @pytest.mark.asyncio
