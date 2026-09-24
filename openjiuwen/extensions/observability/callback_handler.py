@@ -150,6 +150,7 @@ from openjiuwen.extensions.observability.span_context import (
     pop_tool_span,
     push_tool_span,
     set_current_session_id,
+    tool_spans_suppressed,
 )
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.llm.schema.message import (
@@ -404,6 +405,33 @@ class OtelCallbackHandler:
             occurrence_ids=self._message_occurrence_ids(messages),
             source_metadata=(),
         )
+
+    def record_request_input(self, span: Span, messages: Any) -> None:
+        """Record a model request's messages on an inference span.
+
+        Writes the same standard input attributes a framework model call gets
+        (``gen_ai.system_instructions`` / ``gen_ai.input.messages``, message
+        provenance and count), for hosts that observe a request made outside
+        the framework model client, such as a third-party harness.
+
+        Args:
+            span: The recording inference span.
+            messages: Request messages, objects or dicts, system entries first.
+        """
+        normalized = self._normalize_messages(messages)
+        span.set_attribute(OJ_REQUEST_MESSAGE_COUNT, len(normalized))
+        self._record_input_message_provenance(span, normalized)
+        self._record_standard_structured_input(span, normalized)
+
+    def record_response_output(self, span: Span, message: Any) -> None:
+        """Record a model reply on an inference span as ``gen_ai.output.messages``.
+
+        Args:
+            span: The recording inference span.
+            message: The assistant message, an object or a dict carrying
+                ``content`` / ``reasoning_content`` / ``tool_calls``.
+        """
+        self._record_structured_output(span, message)
 
     @staticmethod
     def _get_parent_context_for_llm_tool() -> Any:
@@ -728,6 +756,11 @@ class OtelCallbackHandler:
             inputs = kwargs.get("inputs")
 
             authoritative = self._matching_authoritative_tool_span(tool_name, tool_id)
+            if authoritative is None and tool_spans_suppressed(tool_name):
+                # The caller records this call in its own lane; a span here
+                # would state it a second time, under whichever agent owns
+                # this context rather than under the one that called it.
+                return
             if authoritative is not None:
                 if tool_id is not None:
                     authoritative.set_attribute(OJ_TOOL_RESOURCE_ID, str(tool_id))
@@ -774,6 +807,10 @@ class OtelCallbackHandler:
                 authoritative.set_attribute(GEN_AI_TOOL_CALL_RESULT, redacted)
                 publish_span_snapshot(authoritative, "output")
                 return result
+            if tool_spans_suppressed(tool_name):
+                # Nothing was pushed for this call, and tool spans are keyed by
+                # name: popping here would end a span belonging to another call.
+                return result
             span = pop_tool_span(tool_name)
             if span is None:
                 return result
@@ -812,6 +849,10 @@ class OtelCallbackHandler:
             exc = kwargs.get("error") or kwargs.get("exception")
             tool_id = kwargs.get("tool_id")
             if self._matching_authoritative_tool_span(tool_name, tool_id) is not None:
+                return
+            if tool_spans_suppressed(tool_name):
+                # Nothing was pushed for this call, and tool spans are keyed by
+                # name: popping here would end a span belonging to another call.
                 return
             span = pop_tool_span(tool_name)
             if span is None:
