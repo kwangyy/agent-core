@@ -29,23 +29,24 @@ class WindowsLastInputProbe:
     wrap together every ~49.7 days, so the difference is taken modulo 2**32.
     """
 
-    def seconds_since_last_input(self) -> Optional[float]:
+    @staticmethod
+    def seconds_since_last_input() -> Optional[float]:
         """Seconds since the last mouse or keyboard event, or ``None`` if the call fails."""
         try:
             import ctypes
             from ctypes import wintypes
 
-            class LASTINPUTINFO(ctypes.Structure):
+            class LastInputInfo(ctypes.Structure):
                 """Win32 LASTINPUTINFO structure."""
 
-                _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+                _fields_ = [("cb_size", wintypes.UINT), ("dw_time", wintypes.DWORD)]
 
-            info = LASTINPUTINFO()
-            info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            info = LastInputInfo()
+            info.cb_size = ctypes.sizeof(LastInputInfo)
             if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
                 return None
             now = ctypes.windll.kernel32.GetTickCount()
-            return ((int(now) - int(info.dwTime)) & 0xFFFFFFFF) / 1000.0
+            return ((int(now) - int(info.dw_time)) & 0xFFFFFFFF) / 1000.0
         except Exception:  # noqa: BLE001 - a broken probe must never block desktop work
             return None
 

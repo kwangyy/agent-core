@@ -507,7 +507,8 @@ class CuaUserTakeoverRail(AgentRail):
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
-        if active_within_s <= 0 or resume_after_idle_s <= 0 or max_wait_s <= 0 or poll_interval_s <= 0:
+        thresholds = (active_within_s, resume_after_idle_s, max_wait_s, poll_interval_s)
+        if any(value <= 0 for value in thresholds):
             raise ValueError("cua takeover thresholds must be positive seconds")
         self._tool_prefix = mcp_model_tool_prefix(mcp_cfg.server_name)
         self._input_tool_names = frozenset(
@@ -759,7 +760,7 @@ class CuaSnapshotFreshnessRail(AgentRail):
         tool_name = str(inputs.tool_name or "")
         if not tool_name.startswith(self._tool_prefix):
             return
-        if tool_name[len(self._tool_prefix) :] not in _SNAPSHOT_TOOLS:
+        if tool_name.removeprefix(self._tool_prefix) not in _SNAPSHOT_TOOLS:
             return
         args, was_json_encoded = _normalize_tool_args(inputs.tool_args)
         if args is None or not args.get("query"):
@@ -784,7 +785,7 @@ class CuaSnapshotFreshnessRail(AgentRail):
             # A rail-side rejection never reached the driver: window state and
             # the element cache are exactly what they were.
             return
-        short_name = tool_name[len(self._tool_prefix) :]
+        short_name = tool_name.removeprefix(self._tool_prefix)
         args, _ = _normalize_tool_args(inputs.tool_args)
         if args is None:
             return
@@ -1025,7 +1026,7 @@ class CuaProgressRail(AgentRail):
         tool_name = str(inputs.tool_name or "")
         if not tool_name.startswith(self._tool_prefix):
             return
-        short_name = tool_name[len(self._tool_prefix) :]
+        short_name = tool_name.removeprefix(self._tool_prefix)
         if ctx.extra.get("_skip_tool"):
             # A rail-side rejection never reached the driver. A repeat-failure
             # block is still terminal for the run: the model was thrashing on
