@@ -1,0 +1,1490 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""Tests for the cua runtime and delivery-mode rails."""
+
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from openjiuwen.core.common.exception.errors import BaseError
+from openjiuwen.core.foundation.llm import ToolMessage
+from openjiuwen.core.foundation.tool import McpServerConfig
+from openjiuwen.core.single_agent.rail.base import ToolCallInputs
+from openjiuwen.harness.tools.cua.rails import (
+    CuaDeliveryModeRail,
+    CuaElementAddressingRail,
+    CuaProgressRail,
+    CuaRepeatFailureRail,
+    CuaRuntimeRail,
+    CuaScreenshotDownscaleRail,
+    CuaSnapshotFreshnessRail,
+    CuaUserTakeoverRail,
+)
+
+
+def _mcp_cfg() -> McpServerConfig:
+    return McpServerConfig(
+        server_id="cua_driver_stdio",
+        server_name="cua-driver",
+        server_path="stdio://cua-driver",
+        client_type="stdio",
+        params={"command": "cua-driver", "args": ["mcp"]},
+    )
+
+
+def _ctx(session_id: str = "session-1") -> SimpleNamespace:
+    session = MagicMock()
+    session.get_session_id.return_value = session_id
+    return SimpleNamespace(agent=MagicMock(), session=session)
+
+
+def _probe_process(returncode: int = 0, stderr: bytes = b"") -> MagicMock:
+    process = MagicMock()
+    process.returncode = returncode
+    process.communicate = AsyncMock(return_value=(b"{}", stderr))
+    process.kill = MagicMock()
+    return process
+
+
+def _driver_cli(
+    *,
+    call: int = 1,
+    call_stderr: bytes = b"daemon is not running",
+    daemon_running: bool = False,
+    version: bytes = b"cua-driver 0.28.1",
+    version_stderr: bytes = b"",
+) -> AsyncMock:
+    """Scripted cua-driver CLI keyed on the subcommand the rail runs."""
+
+    def _process(*args, **_kwargs) -> MagicMock:
+        subcommand = args[1]
+        process = MagicMock()
+        process.kill = MagicMock()
+        if subcommand == "call":
+            process.returncode = call
+            process.communicate = AsyncMock(return_value=(b"{}", b"" if call == 0 else call_stderr))
+        elif subcommand == "status":
+            process.returncode = 0 if daemon_running else 1
+            process.communicate = AsyncMock(return_value=(b"", b""))
+        else:  # --version
+            process.returncode = 0
+            process.communicate = AsyncMock(return_value=(version, version_stderr))
+        return process
+
+    return AsyncMock(side_effect=_process)
+
+
+def _subcommands(cli: AsyncMock) -> list:
+    return [c.args[1] for c in cli.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_before_invoke_fails_loud_when_no_daemon_and_driver_cannot_launch_one(monkeypatch) -> None:
+    # A driver older than 0.28.1 has an MCP proxy that refuses to start without
+    # a daemon; letting the run through would only fail later, mid-task.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _driver_cli(version=b"cua-driver 0.10.0"))
+    rail = CuaRuntimeRail(_mcp_cfg())
+
+    with pytest.raises(BaseError, match="0.10.0 .*cannot launch one.*uv sync"):
+        await rail.before_invoke(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_no_daemon_is_fine_when_the_driver_proxy_launches_its_own(monkeypatch) -> None:
+    # The bundled driver's MCP proxy starts a daemon on demand, so `uv sync`
+    # alone must be enough: no daemon running is not a reason to abort.
+    cli = _driver_cli(version=b"cua-driver 0.28.1")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", cli)
+    rail = CuaRuntimeRail(_mcp_cfg(), ("click",))
+    ctx = _ctx()
+
+    await rail.before_invoke(ctx)
+
+    assert _subcommands(cli) == ["call", "status", "--version"]
+    ctx.agent.ability_manager.add.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_running_daemon_that_fails_the_probe_fails_loud(monkeypatch) -> None:
+    # A stale older daemon holding the pipe answers, but incompatibly. The
+    # proxy would attach to it instead of launching a fresh one, so even a
+    # self-launching driver must not let this through.
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        _driver_cli(call_stderr=b"daemon is incompatible: Unknown method: metadata", daemon_running=True),
+    )
+    rail = CuaRuntimeRail(_mcp_cfg())
+
+    with pytest.raises(BaseError, match="running daemon.*Unknown method: metadata"):
+        await rail.before_invoke(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_driver_version_is_read_from_stdout_not_the_update_banner(monkeypatch) -> None:
+    # The driver prints "v0.34.1 is available" on stderr; reading the version
+    # from there would wave an old, non-launching driver through.
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        _driver_cli(version=b"cua-driver 0.10.0", version_stderr=b"cua-driver v0.34.1 is available"),
+    )
+    rail = CuaRuntimeRail(_mcp_cfg())
+
+    with pytest.raises(BaseError, match="cannot launch one"):
+        await rail.before_invoke(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_before_invoke_fails_loud_when_binary_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=FileNotFoundError()),
+    )
+    rail = CuaRuntimeRail(_mcp_cfg())
+
+    with pytest.raises(BaseError, match="binary not found.*uv sync"):
+        await rail.before_invoke(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_before_invoke_applies_allowlist_and_starts_session(monkeypatch) -> None:
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_probe_process()))
+    start_tool = MagicMock()
+    start_tool.invoke = AsyncMock()
+    resource_mgr = MagicMock()
+    resource_mgr.get_tool.return_value = start_tool
+    from openjiuwen.core.runner.runner import Runner
+
+    monkeypatch.setattr(Runner, "resource_mgr", resource_mgr)
+
+    cfg = _mcp_cfg()
+    rail = CuaRuntimeRail(cfg, ("list_apps", "click"))
+    ctx = _ctx(session_id="abc123")
+
+    await rail.before_invoke(ctx)
+
+    ability_manager = ctx.agent.ability_manager
+    ability_manager.add.assert_called_once_with(cfg)
+    ability_manager.set_mcp_tool_allowlist.assert_called_once_with(cfg, ("list_apps", "click"))
+    resource_mgr.get_tool.assert_called_once_with("cua_driver_stdio.cua-driver.start_session")
+    start_tool.invoke.assert_awaited_once_with({"session": "cua-abc123"})
+
+
+@pytest.mark.asyncio
+async def test_session_failures_never_block_the_run(monkeypatch) -> None:
+    # Session identity is cosmetic; the daemon idle TTL reclaims leaks.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_probe_process()))
+    failing_tool = MagicMock()
+    failing_tool.invoke = AsyncMock(side_effect=RuntimeError("denied"))
+    resource_mgr = MagicMock()
+    resource_mgr.get_tool.return_value = failing_tool
+    from openjiuwen.core.runner.runner import Runner
+
+    monkeypatch.setattr(Runner, "resource_mgr", resource_mgr)
+
+    rail = CuaRuntimeRail(_mcp_cfg())
+    ctx = _ctx()
+
+    await rail.before_invoke(ctx)  # start_session raises internally -> warning only
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_setup_is_cached_after_the_first_invoke(monkeypatch) -> None:
+    # The security gate's approval path re-enters before_invoke before every
+    # gated call; in the recorded corpus that made session lifecycle 38.9% of
+    # all driver calls (~7 start/end pairs per run, 57-59% provable no-ops).
+    # Setup must therefore run once per run, not once per loop entry.
+    probe = AsyncMock(return_value=_probe_process())
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", probe)
+    tool = MagicMock()
+    tool.invoke = AsyncMock()
+    resource_mgr = MagicMock()
+    resource_mgr.get_tool.return_value = tool
+    from openjiuwen.core.runner.runner import Runner
+
+    monkeypatch.setattr(Runner, "resource_mgr", resource_mgr)
+
+    rail = CuaRuntimeRail(_mcp_cfg(), ("click",))
+    ctx = _ctx(session_id="abc123")
+
+    await rail.before_invoke(ctx)
+    await rail.after_invoke(ctx)  # an approval round-trip crosses the invoke boundary
+    await rail.before_invoke(ctx)
+
+    assert probe.await_count == 1
+    ctx.agent.ability_manager.add.assert_called_once()
+    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once()
+    tool.invoke.assert_awaited_once_with({"session": "cua-abc123"})
+
+
+@pytest.mark.asyncio
+async def test_the_session_is_left_to_the_daemon_idle_ttl(monkeypatch) -> None:
+    # Explicit end_session per invoke was half the lifecycle churn. The daemon
+    # reclaims idle sessions itself and the rail already documented that as
+    # the self-heal path, so the rail no longer ends sessions at all.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_probe_process()))
+    tool = MagicMock()
+    tool.invoke = AsyncMock()
+    resource_mgr = MagicMock()
+    resource_mgr.get_tool.return_value = tool
+    from openjiuwen.core.runner.runner import Runner
+
+    monkeypatch.setattr(Runner, "resource_mgr", resource_mgr)
+
+    rail = CuaRuntimeRail(_mcp_cfg())
+    ctx = _ctx(session_id="xyz789")
+
+    await rail.before_invoke(ctx)
+    await rail.after_invoke(ctx)
+
+    tool.invoke.assert_awaited_once_with({"session": "cua-xyz789"})  # start only, never end
+    requested = [str(c) for c in resource_mgr.get_tool.call_args_list]
+    assert not any("end_session" in r for r in requested)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_probe_is_retried_on_the_next_invoke(monkeypatch) -> None:
+    # Only success is cached: a daemon that was down must be re-checked, or
+    # the run would proceed against a runtime never seen alive.
+    down = _driver_cli(version=b"cua-driver 0.10.0")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", down)
+    resource_mgr = MagicMock()
+    resource_mgr.get_tool.return_value = None
+    from openjiuwen.core.runner.runner import Runner
+
+    monkeypatch.setattr(Runner, "resource_mgr", resource_mgr)
+    rail = CuaRuntimeRail(_mcp_cfg())
+
+    with pytest.raises(BaseError):
+        await rail.before_invoke(_ctx())
+
+    up = _driver_cli(call=0)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", up)
+    await rail.before_invoke(_ctx())
+    await rail.before_invoke(_ctx())
+
+    assert _subcommands(up) == ["call"]  # re-probed once after the failure, then cached
+
+
+# ---------------------------------------------------------------------------
+# CuaDeliveryModeRail
+# ---------------------------------------------------------------------------
+
+
+def _tool_ctx(tool_name: str, tool_args) -> SimpleNamespace:
+    # A real ToolCallInputs: the rail narrows on it before touching tool_args,
+    # so a duck-typed stand-in would pass the test while skipping the rail.
+    inputs = ToolCallInputs(
+        tool_call=SimpleNamespace(id="call-1"),
+        tool_name=tool_name,
+        tool_args=tool_args,
+    )
+    return SimpleNamespace(inputs=inputs, extra={})
+
+
+# ── CuaUserTakeoverRail ──────────────────────────────────────────────────
+#
+# "Once the user takes over the screen, the agent should pause." The rail
+# must hold desktop actions while the OS reports recent user input, release
+# them once the desktop is idle again, and give up (with a report) rather
+# than wait forever. All timing is driven by a fake clock and probe.
+
+
+class _FakeDesktop:
+    """Scripted probe + clock: ``idle_values`` are returned per poll in order."""
+
+    def __init__(self, idle_values):
+        self.idle_values = list(idle_values)
+        self.now = 100.0
+        self.slept = 0.0
+
+    def seconds_since_last_input(self):
+        if len(self.idle_values) > 1:
+            return self.idle_values.pop(0)
+        return self.idle_values[0]
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.slept += seconds
+        self.now += seconds
+
+
+def _takeover_rail(desk: _FakeDesktop, **overrides) -> CuaUserTakeoverRail:
+    kwargs = dict(
+        probe=desk,
+        active_within_s=3.0,
+        resume_after_idle_s=5.0,
+        max_wait_s=10.0,
+        poll_interval_s=1.0,
+        sleep=desk.sleep,
+        monotonic=desk.monotonic,
+    )
+    kwargs.update(overrides)
+    return CuaUserTakeoverRail(_mcp_cfg(), **kwargs)
+
+
+def _finish_call(ctx, text: str = "\u2705 ok") -> None:
+    ctx.inputs.tool_result = {"content": text}
+    ctx.inputs.tool_msg = ToolMessage(content=text, tool_call_id="call-1")
+
+
+@pytest.mark.asyncio
+async def test_idle_desktop_never_delays_an_action() -> None:
+    desk = _FakeDesktop([42.0])
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+    _finish_call(ctx)
+    await rail.after_tool_call(ctx)
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+    assert "held" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_action_is_held_while_the_user_is_active_then_released() -> None:
+    # User active (idle 0.5s, 1.0s), then hands off: idle grows past 5s.
+    desk = _FakeDesktop([0.5, 1.0, 2.0, 6.0])
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"})
+
+    await rail.before_tool_call(ctx)
+
+    assert not ctx.extra.get("_skip_tool")
+    assert desk.slept == 3.0  # three polls before the desktop was idle >= 5s
+    _finish_call(ctx)
+    await rail.after_tool_call(ctx)
+    assert "held for 3s" in ctx.inputs.tool_msg.content
+    assert "re-snapshot" in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_a_takeover_that_outlasts_the_budget_ends_with_a_report() -> None:
+    desk = _FakeDesktop([0.2])  # user never stops
+    rail = _takeover_rail(desk)
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.extra["_skip_tool"] is True
+    assert desk.slept == 10.0
+    assert "taken over the desktop" in ctx.inputs.tool_result["error"]
+    assert ctx.inputs.tool_msg.tool_call_id == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_the_agents_own_foreground_input_is_not_mistaken_for_the_user() -> None:
+    # Under foreground delivery the agent's click is a real OS input event.
+    # After a click 2.0s ago, the OS reports idle=2.0s: that is the agent.
+    desk = _FakeDesktop([2.0])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    _finish_call(click)
+    await rail.after_tool_call(click)  # records own input at now=100
+    desk.now = 102.0
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_user_input_after_the_agents_own_input_still_pauses() -> None:
+    # Agent clicked 2.0s ago but the OS saw input 0.3s ago: that is the user.
+    desk = _FakeDesktop([0.3, 0.3, 9.0])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    _finish_call(click)
+    await rail.after_tool_call(click)
+    desk.now = 102.0
+
+    ctx = _tool_ctx("mcp_cua-driver_scroll", {"pid": 1})
+    await rail.before_tool_call(ctx)
+
+    assert desk.slept == 2.0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_slow_driver_round_trip_does_not_turn_the_agents_own_click_into_a_takeover() -> None:
+    # The OS input event happens when the driver injects the click, shortly
+    # after dispatch; the rail only learns the call is over when the MCP
+    # round-trip returns. Timestamping own input at return time made every
+    # round-trip slower than the grace window look like the user.
+    desk = _FakeDesktop([42.0, 2.4])
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await rail.before_tool_call(click)  # dispatched at now=100, injected ~100.2
+    desk.now = 102.5  # driver took 2.5s to answer
+    _finish_call(click)
+    await rail.after_tool_call(click)
+    desk.now = 102.6
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)  # OS: last input 2.4s ago = the click
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_long_type_text_is_attributed_to_the_agent_until_its_last_keystroke() -> None:
+    # Typing a long string keeps injecting keystrokes until the call returns,
+    # so the last OS event sits near the END of the round-trip, not the start.
+    desk = _FakeDesktop([42.0, 0.3])
+    rail = _takeover_rail(desk)
+    typing = _tool_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "a long paragraph"})
+    await rail.before_tool_call(typing)  # dispatched at now=100
+    desk.now = 103.0  # last keystroke landed ~102.9
+    _finish_call(typing)
+    await rail.after_tool_call(typing)
+    desk.now = 103.2
+
+    ctx = _tool_ctx("mcp_cua-driver_get_window_state", {"pid": 1})
+    await rail.before_tool_call(ctx)  # OS: last input 0.3s ago = our keystroke
+
+    assert desk.slept == 0
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_input_call_does_not_widen_the_agents_own_input_window() -> None:
+    # A call this rail rejected never reached the desktop. Recording it as own
+    # input would stretch the attribution window over the user's activity.
+    desk = _FakeDesktop([0.2])  # user never stops
+    rail = _takeover_rail(desk)
+    click = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await rail.before_tool_call(click)
+    assert click.extra["_skip_tool"] is True
+    await rail.after_tool_call(click)
+
+    assert rail._last_own_input_at is None
+
+
+@pytest.mark.asyncio
+async def test_rail_is_inert_without_a_probe_and_for_non_cua_tools() -> None:
+    desk = _FakeDesktop([0.1])
+    no_probe = CuaUserTakeoverRail(_mcp_cfg(), probe=None, sleep=desk.sleep, monotonic=desk.monotonic)
+    no_probe._probe = None  # platform without a probe
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1})
+    await no_probe.before_tool_call(ctx)
+    assert not ctx.extra.get("_skip_tool") and desk.slept == 0
+
+    rail = _takeover_rail(desk)
+    other = _tool_ctx("read_file", {"path": "x"})
+    await rail.before_tool_call(other)
+    assert desk.slept == 0 and not other.extra.get("_skip_tool")
+
+
+def test_takeover_thresholds_are_validated() -> None:
+    with pytest.raises(ValueError):
+        CuaUserTakeoverRail(_mcp_cfg(), probe=_FakeDesktop([1.0]), max_wait_s=0)
+
+
+@pytest.mark.asyncio
+async def test_non_tool_call_inputs_are_ignored() -> None:
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "background")
+    ctx = SimpleNamespace(inputs={"tool_name": "mcp_cua-driver_click"}, extra={})
+
+    await rail.before_tool_call(ctx)  # must not raise on a non-ToolCallInputs payload
+
+    assert ctx.extra == {}
+
+
+@pytest.mark.asyncio
+async def test_background_mode_injects_when_the_model_omits_delivery_mode() -> None:
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "background")
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1, "window_id": 2})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args["delivery_mode"] == "background"
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_foreground_mode_must_inject_because_the_driver_default_is_background() -> None:
+    # The whole reason injection exists: omitting delivery_mode falls back to
+    # the driver's "background" default, which silently violates a foreground
+    # -only policy. Rejection alone could never enforce this direction.
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "foreground")
+    ctx = _tool_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args["delivery_mode"] == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_background_mode_rejects_explicit_foreground_rather_than_rewriting() -> None:
+    # cua-driver's background_unavailable error tells the model to retry with
+    # foreground. Rewriting that retry back to background would loop the model
+    # against the driver's own advice with no signal, so it must be rejected.
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "background")
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1, "delivery_mode": "foreground"})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.extra["_skip_tool"] is True
+    assert "background-only" in ctx.inputs.tool_result["error"]
+    assert ctx.inputs.tool_msg.tool_call_id == "call-1"
+    # The rejected args are never handed to the driver.
+    assert ctx.inputs.tool_args["delivery_mode"] == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_foreground_mode_overrides_explicit_background() -> None:
+    # Safe to override here: foreground delivery cannot fail the way background
+    # can, so there is no retry loop to warn the model about.
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "foreground")
+    ctx = _tool_ctx("mcp_cua-driver_scroll", {"pid": 1, "delivery_mode": "background"})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args["delivery_mode"] == "foreground"
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_json_encoded_args_are_written_back_as_json() -> None:
+    # tool_args arrives as the raw ToolCall.arguments string before the ability
+    # manager parses it; writing a dict back would change the type downstream.
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "background")
+    ctx = _tool_ctx("mcp_cua-driver_click", json.dumps({"pid": 1}))
+
+    await rail.before_tool_call(ctx)
+
+    assert isinstance(ctx.inputs.tool_args, str)
+    assert json.loads(ctx.inputs.tool_args)["delivery_mode"] == "background"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["set_value", "launch_app", "bring_to_front", "get_window_state"])
+async def test_tools_without_a_delivery_mode_argument_are_left_alone(tool_name: str) -> None:
+    # set_value ships in the same "input" capability bundle as click but takes
+    # no delivery_mode; injecting one would send an unknown argument.
+    rail = CuaDeliveryModeRail(_mcp_cfg(), "background")
+    ctx = _tool_ctx(f"mcp_cua-driver_{tool_name}", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+
+    assert "delivery_mode" not in ctx.inputs.tool_args
+
+
+@pytest.mark.asyncio
+async def test_instance_isolated_server_names_are_matched() -> None:
+    # cua_instance_key renames the server, which is what makes the built-in
+    # os_control permission rules miss. Building names from the config avoids it.
+    cfg = _mcp_cfg()
+    cfg.server_name = "cua-driver-run7"
+    rail = CuaDeliveryModeRail(cfg, "background")
+    ctx = _tool_ctx("mcp_cua-driver-run7_click", {"pid": 1})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args["delivery_mode"] == "background"
+
+
+def test_invalid_delivery_mode_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match="background"):
+        CuaDeliveryModeRail(_mcp_cfg(), "sideways")
+
+
+# ---------------------------------------------------------------------------
+# CuaDeliveryModeRail end-to-end through the real tool-dispatch pipeline
+#
+# The tests above hand-build the callback context, which proves the rail
+# mutates it but silently trusts the framework to honor those mutations. These
+# drive a real ReActAgent + AbilityManager loop with a scripted LLM, so a
+# refactor that stops honoring _skip_tool or tool_args rewrites (e.g. copying
+# args before rails run) fails here even though every unit test still passes.
+# ---------------------------------------------------------------------------
+
+# Shared with the registered tool's closure: Runner.resource_mgr is
+# process-global, so the first registered instance may serve later tests.
+_CLICK_INVOCATIONS: list[dict] = []
+
+
+def _make_cua_agent():
+    """ReActAgent with a recording fake mcp_cua-driver_click tool."""
+    import os
+
+    from openjiuwen.core.foundation.llm import ModelClientConfig, ModelRequestConfig
+    from openjiuwen.core.foundation.tool import LocalFunction, ToolCard
+    from openjiuwen.core.runner import Runner
+    from openjiuwen.core.single_agent import AgentCard, ReActAgent, ReActAgentConfig
+
+    os.environ.setdefault("LLM_SSL_VERIFY", "false")
+    _CLICK_INVOCATIONS.clear()
+    tool = LocalFunction(
+        card=ToolCard(
+            id="mcp_cua-driver_click",
+            name="mcp_cua-driver_click",
+            description="fake cua click",
+            input_params={
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer"},
+                    "delivery_mode": {"type": "string"},
+                },
+                "required": ["pid"],
+            },
+        ),
+        func=lambda **kwargs: (_CLICK_INVOCATIONS.append(kwargs), "clicked")[1],
+    )
+    config = ReActAgentConfig(
+        model_config_obj=ModelRequestConfig(model="test-model"),
+        model_client_config=ModelClientConfig(
+            client_provider="OpenAI", api_key="mock_key", api_base="mock_url", verify_ssl=False
+        ),
+        prompt_template=[dict(role="system", content="desktop test agent")],
+    )
+    agent = ReActAgent(card=AgentCard(description="cua rail test")).configure(config)
+    agent.ability_manager.add(tool.card)
+    if Runner.resource_mgr.get_tool(tool.card.id) is None:
+        Runner.resource_mgr.add_tool(tool)
+    return agent
+
+
+async def _invoke_with_click(agent, arguments: str) -> object:
+    from unittest.mock import patch as mock_patch
+
+    from tests.unit_tests.fixtures.mock_llm import (
+        MockLLMModel,
+        create_text_response,
+        create_tool_call_response,
+    )
+
+    mock_llm = MockLLMModel()
+    mock_llm.set_responses(
+        [
+            create_tool_call_response("mcp_cua-driver_click", arguments),
+            create_text_response("done"),
+        ]
+    )
+    with mock_patch.object(agent, "_get_llm", return_value=mock_llm):
+        await agent.invoke({"query": "click it"})
+    return mock_llm
+
+
+@pytest.mark.asyncio
+async def test_pipeline_injects_delivery_mode_into_the_executed_tool() -> None:
+    agent = _make_cua_agent()
+    await agent.register_rail(CuaDeliveryModeRail(_mcp_cfg(), "background"))
+
+    await _invoke_with_click(agent, '{"pid": 42}')
+
+    # The tool itself received the injected mode — not just the rail context.
+    assert _CLICK_INVOCATIONS == [{"pid": 42, "delivery_mode": "background"}]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_blocks_foreground_and_returns_the_rejection_to_the_model() -> None:
+    agent = _make_cua_agent()
+    await agent.register_rail(CuaDeliveryModeRail(_mcp_cfg(), "background"))
+
+    mock_llm = await _invoke_with_click(agent, '{"pid": 42, "delivery_mode": "foreground"}')
+
+    # Enforcement: the driver tool never executed.
+    assert _CLICK_INVOCATIONS == []
+    # Teaching: the model's next turn sees the rejection, not a silent stall.
+    followup_tool_msgs = [msg.content for msg in mock_llm.call_history[1] if getattr(msg, "role", None) == "tool"]
+    assert any("background-only" in str(content) for content in followup_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_foreground_pin_overrides_explicit_background() -> None:
+    agent = _make_cua_agent()
+    await agent.register_rail(CuaDeliveryModeRail(_mcp_cfg(), "foreground"))
+
+    await _invoke_with_click(agent, '{"pid": 42, "delivery_mode": "background"}')
+
+    assert _CLICK_INVOCATIONS == [{"pid": 42, "delivery_mode": "foreground"}]
+
+
+# ---------------------------------------------------------------------------
+# CuaScreenshotDownscaleRail
+# ---------------------------------------------------------------------------
+
+
+def _noise_png_data_url(width: int = 600, height: int = 400) -> str:
+    """Random-noise PNG: incompressible, so it reliably exceeds the budget."""
+    import base64
+    import io
+    import os
+
+    from PIL import Image
+
+    img = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _screenshot_ctx(tool_name: str, tool_result) -> SimpleNamespace:
+    from openjiuwen.core.foundation.llm import ToolMessage
+
+    inputs = ToolCallInputs(
+        tool_call=SimpleNamespace(id="call-1"),
+        tool_name=tool_name,
+        tool_args={},
+    )
+    inputs.tool_result = tool_result
+    inputs.tool_msg = ToolMessage(content="tree summary", tool_call_id="call-1")
+    return SimpleNamespace(inputs=inputs, extra={})
+
+
+@pytest.mark.asyncio
+async def test_oversized_screenshot_is_downscaled_in_place() -> None:
+    pytest.importorskip("PIL")
+    original = _noise_png_data_url()
+    item = {"type": "image", "source": "mcp", "mime_type": "image/png", "data_url": original}
+    tool_result = SimpleNamespace(data={"content": "tree", "multimodal": [item]})
+    ctx = _screenshot_ctx("mcp_cua-driver_get_window_state", tool_result)
+
+    rail = CuaScreenshotDownscaleRail(_mcp_cfg())
+    await rail.after_tool_call(ctx)
+
+    # In-place mutation: react_agent consumes the same result object the
+    # ability manager returned, so a replaced object would silently be lost.
+    assert ctx.inputs.tool_result is tool_result
+    assert tool_result.data["multimodal"][0] is item
+    assert item["data_url"].startswith("data:image/jpeg;base64,")
+    assert len(item["data_url"]) < len(original)
+    assert item["mime_type"] == "image/jpeg"
+    # 600x400 fits within max_edge: re-encode without resize keeps the
+    # coordinate space, so no scale note may appear (it would be false).
+    assert "[screenshot scaled]" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_resized_screenshot_appends_scale_note_to_tool_message() -> None:
+    # A model reading pixels off a resized screenshot misclicks by the scale
+    # factor unless told; the note must reach the ALREADY-BUILT ToolMessage,
+    # not just data["content"] (live-confirmed failure mode: coordinates were
+    # read off an 800px image of a ~1330px window).
+    pytest.importorskip("PIL")
+    original = _noise_png_data_url(2000, 1200)
+    item = {"type": "image", "source": "mcp", "mime_type": "image/png", "data_url": original}
+    tool_result = SimpleNamespace(data={"content": "tree summary", "multimodal": [item]})
+    ctx = _screenshot_ctx("mcp_cua-driver_get_window_state", tool_result)
+
+    rail = CuaScreenshotDownscaleRail(_mcp_cfg())
+    await rail.after_tool_call(ctx)
+
+    assert item["data_url"].startswith("data:image/jpeg;base64,")
+    note = ctx.inputs.tool_msg.content
+    assert "[screenshot scaled]" in note
+    assert "2000x1200" in note
+    assert "multiplied by 2.50" in note  # 2000 -> 800px rung for incompressible noise
+    assert "element_index" in note
+    assert "[screenshot scaled]" in tool_result.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_small_screenshot_is_left_untouched() -> None:
+    small = "data:image/png;base64,QQ=="
+    item = {"type": "image", "mime_type": "image/png", "data_url": small}
+    tool_result = SimpleNamespace(data={"content": "tree", "multimodal": [item]})
+    ctx = _screenshot_ctx("mcp_cua-driver_get_window_state", tool_result)
+
+    await CuaScreenshotDownscaleRail(_mcp_cfg()).after_tool_call(ctx)
+
+    assert item["data_url"] == small
+    assert item["mime_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_non_cua_tools_are_ignored() -> None:
+    pytest.importorskip("PIL")
+    original = _noise_png_data_url()
+    item = {"type": "image", "mime_type": "image/png", "data_url": original}
+    tool_result = SimpleNamespace(data={"content": "x", "multimodal": [item]})
+    ctx = _screenshot_ctx("read_file", tool_result)
+
+    await CuaScreenshotDownscaleRail(_mcp_cfg()).after_tool_call(ctx)
+
+    assert item["data_url"] == original
+
+
+@pytest.mark.asyncio
+async def test_instance_isolated_server_names_are_downscale_matched() -> None:
+    pytest.importorskip("PIL")
+    cfg = _mcp_cfg()
+    cfg.server_name = "cua-driver-run7"
+    original = _noise_png_data_url()
+    item = {"type": "image", "mime_type": "image/png", "data_url": original}
+    tool_result = SimpleNamespace(data={"content": "x", "multimodal": [item]})
+    ctx = _screenshot_ctx("mcp_cua-driver-run7_get_window_state", tool_result)
+
+    await CuaScreenshotDownscaleRail(cfg).after_tool_call(ctx)
+
+    assert item["data_url"].startswith("data:image/jpeg;base64,")
+
+
+@pytest.mark.asyncio
+async def test_legacy_result_shape_is_a_noop() -> None:
+    # Blind-mode results are {"result": str} dicts with no .data attribute.
+    ctx = _screenshot_ctx("mcp_cua-driver_get_window_state", {"result": "snapshot text"})
+
+    await CuaScreenshotDownscaleRail(_mcp_cfg()).after_tool_call(ctx)
+
+    assert ctx.inputs.tool_result == {"result": "snapshot text"}
+
+
+@pytest.mark.asyncio
+async def test_malformed_data_url_is_left_untouched() -> None:
+    # Oversized so the decode path actually runs; not valid base64 image data.
+    malformed = "data:image/png;base64," + "?" * 300_000
+    item = {"type": "image", "mime_type": "image/png", "data_url": malformed}
+    tool_result = SimpleNamespace(data={"content": "x", "multimodal": [item]})
+    ctx = _screenshot_ctx("mcp_cua-driver_get_window_state", tool_result)
+
+    await CuaScreenshotDownscaleRail(_mcp_cfg()).after_tool_call(ctx)
+
+    assert item["data_url"] == malformed
+
+
+# ---------------------------------------------------------------------------
+# CuaElementAddressingRail
+# ---------------------------------------------------------------------------
+
+
+def _result_ctx(tool_name: str, tool_args, content: str) -> SimpleNamespace:
+    """A ToolCallInputs carrying a driver response, as after_tool_call sees it."""
+    inputs = ToolCallInputs(
+        tool_call=SimpleNamespace(id="call-1"),
+        tool_name=tool_name,
+        tool_args=tool_args,
+    )
+    inputs.tool_result = SimpleNamespace(data={"content": content})
+    inputs.tool_msg = ToolMessage(content=content, tool_call_id="call-1")
+    return SimpleNamespace(inputs=inputs, extra={})
+
+
+@pytest.mark.asyncio
+async def test_pixels_are_dropped_when_an_element_index_is_also_present() -> None:
+    # The driver refuses a call carrying both addressing modes, and that
+    # refusal costs a full model turn -- 49 of the failures in the recorded
+    # corpus were exactly this, all on type_text. The either/or is resolvable
+    # without asking the model again, so the rail resolves it.
+    rail = CuaElementAddressingRail(_mcp_cfg())
+    ctx = _tool_ctx(
+        "mcp_cua-driver_type_text",
+        {"pid": 1, "window_id": 2, "element_index": 7, "x": 100, "y": 200, "text": "hi"},
+    )
+
+    await rail.before_tool_call(ctx)
+
+    assert "x" not in ctx.inputs.tool_args
+    assert "y" not in ctx.inputs.tool_args
+    # Element addressing survives: it is what the agent prompt prefers, and it
+    # works on backgrounded windows without moving the user's cursor.
+    assert ctx.inputs.tool_args["element_index"] == 7
+    assert ctx.inputs.tool_args["text"] == "hi"
+    assert not ctx.extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_coordinate_only_calls_are_untouched() -> None:
+    # Surfaces outside the element tree (canvases, ribbons) can only be
+    # addressed by pixel, so stripping coordinates there would break the one
+    # fallback the agent has.
+    rail = CuaElementAddressingRail(_mcp_cfg())
+    ctx = _tool_ctx("mcp_cua-driver_click", {"pid": 1, "x": 100, "y": 200})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args == {"pid": 1, "x": 100, "y": 200}
+
+
+@pytest.mark.asyncio
+async def test_json_encoded_args_are_written_back_json_encoded() -> None:
+    # tool_args arrives as a JSON string until the ability manager parses it;
+    # writing a dict back in that case would hand the driver the wrong shape.
+    rail = CuaElementAddressingRail(_mcp_cfg())
+    ctx = _tool_ctx(
+        "mcp_cua-driver_type_text",
+        json.dumps({"element_index": 3, "x": 5, "y": 6, "text": "hi"}),
+    )
+
+    await rail.before_tool_call(ctx)
+
+    assert isinstance(ctx.inputs.tool_args, str)
+    assert json.loads(ctx.inputs.tool_args) == {"element_index": 3, "text": "hi"}
+
+
+@pytest.mark.asyncio
+async def test_non_cua_tools_are_left_alone() -> None:
+    rail = CuaElementAddressingRail(_mcp_cfg())
+    ctx = _tool_ctx("read_file", {"element_index": 1, "x": 2, "y": 3})
+
+    await rail.before_tool_call(ctx)
+
+    assert ctx.inputs.tool_args == {"element_index": 1, "x": 2, "y": 3}
+
+
+# ---------------------------------------------------------------------------
+# CuaRepeatFailureRail
+# ---------------------------------------------------------------------------
+
+
+_FAILURE = "❌ Pass either element_index (ax) or x,y (px) to type_text, not both."
+_UNVERIFIED = "Sent tab via PostMessage to pid 44452 (not verified)."
+_SUCCESS = "\u2705 Sent tab via SendInput on pid 44452 (delivery_mode:foreground)."
+
+
+async def _replay(rail, tool_name, args, content, times):
+    """Drive the same call through the rail `times` times, returning contexts."""
+    seen = []
+    for _ in range(times):
+        ctx = _result_ctx(tool_name, dict(args) if isinstance(args, dict) else args, content)
+        await rail.before_tool_call(ctx)
+        if not ctx.extra.get("_skip_tool"):
+            await rail.after_tool_call(ctx)
+        seen.append(ctx)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_identical_failures_are_blocked_before_reaching_the_driver() -> None:
+    # One recorded run burned 172 turns and 510s re-sending the same rejected
+    # type_text 55 times and ended on the error it started with. Desktop errors
+    # arrive as ordinary tool results, so no retry rail ever sees them.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    args = {"pid": 1, "element_index": 7, "x": 1, "y": 2, "text": "hi"}
+
+    ctxs = await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 7)
+
+    # Blocking starts on the 7th attempt: 6 identical failures were recorded
+    # before it, which is the block_after threshold.
+    assert not any(c.extra.get("_skip_tool") for c in ctxs[:6])
+    assert ctxs[6].extra["_skip_tool"] is True
+    assert "Blocked" in ctxs[6].inputs.tool_result["error"]
+    # The model is told what to do instead, not merely refused.
+    assert "get_window_state" in ctxs[6].inputs.tool_result["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_warned_before_it_is_blocked() -> None:
+    # A warning the model can act on is worth more than a block it cannot, so
+    # the advisory lands well before the hard stop.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    args = {"pid": 1, "text": "hi"}
+
+    ctxs = await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 3)
+
+    assert not any(c.extra.get("_skip_tool") for c in ctxs)
+    # Annotated in place on both the result data and the already-built message.
+    assert "will not change the result" in ctxs[2].inputs.tool_msg.content
+    assert "will not change the result" in ctxs[2].inputs.tool_result.data["content"]
+    # ...and only the third one is annotated.
+    assert "will not change the result" not in ctxs[0].inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_repeated_successes_are_never_blocked() -> None:
+    # The most-repeated identical calls in the corpus are legitimate: one run
+    # sent press_key tab 27 times walking a form. Repetition alone must never
+    # trip the breaker, or real workflows break.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    args = {"pid": 44452, "key": "tab"}
+
+    ctxs = await _replay(rail, "mcp_cua-driver_press_key", args, _SUCCESS, 27)
+
+    assert not any(c.extra.get("_skip_tool") for c in ctxs)
+    assert all("will not change the result" not in c.inputs.tool_msg.content for c in ctxs)
+
+
+@pytest.mark.asyncio
+async def test_a_success_clears_the_history_for_that_call() -> None:
+    # If the same call starts working, whatever the model was stuck on has
+    # moved; a later unrelated failure must start from a clean count rather
+    # than inheriting a block from earlier in the run.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    args = {"pid": 1, "text": "hi"}
+
+    await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 5)
+    await _replay(rail, "mcp_cua-driver_type_text", args, _SUCCESS, 1)
+    ctxs = await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 3)
+
+    assert not any(c.extra.get("_skip_tool") for c in ctxs)
+
+
+@pytest.mark.asyncio
+async def test_differing_arguments_are_tracked_separately() -> None:
+    # Changing the arguments is exactly the recovery the block asks for, so a
+    # different call must not inherit the failed one's count.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+
+    await _replay(rail, "mcp_cua-driver_type_text", {"pid": 1, "text": "a"}, _FAILURE, 6)
+    ctxs = await _replay(rail, "mcp_cua-driver_type_text", {"pid": 1, "text": "b"}, _FAILURE, 1)
+
+    assert not ctxs[0].extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_session_identity_is_not_part_of_the_repeat_key() -> None:
+    # Concurrent agents run under distinct driver session keys; if session
+    # were part of the key the breaker could silently never fire when the
+    # identity shifts mid-run.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    for i in range(7):
+        ctx = _result_ctx(
+            "mcp_cua-driver_type_text",
+            {"pid": 1, "text": "hi", "session": f"cua-{i}"},
+            _FAILURE,
+        )
+        await rail.before_tool_call(ctx)
+        if not ctx.extra.get("_skip_tool"):
+            await rail.after_tool_call(ctx)
+
+    assert ctx.extra["_skip_tool"] is True
+
+
+@pytest.mark.asyncio
+async def test_counters_reset_between_invokes() -> None:
+    # Counters are per-invoke: a new task must not start life already blocked
+    # by the previous one's failures.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    args = {"pid": 1, "text": "hi"}
+
+    await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 6)
+    await rail.before_invoke(_ctx())
+    ctxs = await _replay(rail, "mcp_cua-driver_type_text", args, _FAILURE, 1)
+
+    assert not ctxs[0].extra.get("_skip_tool")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_call_is_not_counted_as_a_driver_response() -> None:
+    # Another rail's rejection (e.g. the background-only delivery gate) never
+    # reached the driver, so counting it would blame the driver for a local
+    # policy decision.
+    rail = CuaRepeatFailureRail(_mcp_cfg())
+    for _ in range(9):
+        ctx = _result_ctx("mcp_cua-driver_click", {"pid": 1}, "rejected by policy")
+        ctx.extra["_skip_tool"] = True
+        await rail.after_tool_call(ctx)
+
+    fresh = _result_ctx("mcp_cua-driver_click", {"pid": 1}, "rejected by policy")
+    await rail.before_tool_call(fresh)
+
+    assert not fresh.extra.get("_skip_tool")
+
+
+def test_invalid_thresholds_fail_at_construction() -> None:
+    with pytest.raises(ValueError):
+        CuaRepeatFailureRail(_mcp_cfg(), advise_after=5, block_after=2)
+    with pytest.raises(ValueError):
+        CuaRepeatFailureRail(_mcp_cfg(), advise_after=0, block_after=3)
+
+
+# ---------------------------------------------------------------------------
+# CuaSnapshotFreshnessRail
+# ---------------------------------------------------------------------------
+
+
+async def _observe(rail, tool_short, args, content):
+    """Feed one completed cua driver call through the freshness rail."""
+    ctx = _result_ctx("mcp_cua-driver_" + tool_short, dict(args), content)
+    await rail.after_tool_call(ctx)
+    return ctx
+
+
+async def _snapshot_round_trip(rail, args, content: str = "✅ tree"):
+    """One snapshot through both hooks, as the runtime drives them."""
+    ctx = _result_ctx("mcp_cua-driver_get_window_state", args, content)
+    await rail.before_tool_call(ctx)
+    await rail.after_tool_call(ctx)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_query_is_dropped_from_the_first_snapshot_after_an_action() -> None:
+    # Bench-observed: a verify snapshot filtered to the clicked file's name hid
+    # the Explorer status bar that proved the selection, the model read the
+    # absence as failure and spiralled for 20 steps. The prompt already says
+    # not to filter verification snapshots and the model ignores it, so the
+    # rail must remove the filter itself and tell the model why.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
+    verify = await _snapshot_round_trip(rail, {**win, "query": "bench_item_07", "max_elements": 200})
+
+    assert "query" not in verify.inputs.tool_args
+    assert verify.inputs.tool_args["max_elements"] == 200, "size bounds must survive; only the filter goes"
+    assert "query='bench_item_07' was dropped" in verify.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_query_is_kept_on_discovery_snapshots() -> None:
+    # A window not acted on since its last snapshot (or never seen) is being
+    # explored, not verified: filtering a 5000-element Chromium tree down to
+    # the control being looked for is exactly what query is for.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    never_seen = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+    still_fresh = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+
+    for ctx in (never_seen, still_fresh):
+        assert ctx.inputs.tool_args["query"] == "Save"
+        assert "was dropped" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_dropped_query_is_written_back_in_the_json_shape_it_arrived_in() -> None:
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "type_text", {**win, "element_index": 0, "text": "x"}, "✅ typed")
+    verify = await _snapshot_round_trip(rail, json.dumps({**win, "query": "Unmodified"}))
+
+    assert isinstance(verify.inputs.tool_args, str)
+    assert json.loads(verify.inputs.tool_args) == win
+    assert "query='Unmodified' was dropped" in verify.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_re_freshens_the_window_so_the_next_query_survives() -> None:
+    # The drop is scoped to the FIRST snapshot after an action, because that is
+    # the one verifying the action. Once it has been taken the window is fresh
+    # again and a follow-up filtered read is discovery, not verification.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
+    verify = await _snapshot_round_trip(rail, {**win, "query": "Saved"})
+    follow_up = await _snapshot_round_trip(rail, {**win, "query": "Saved"})
+
+    assert "query" not in verify.inputs.tool_args
+    assert follow_up.inputs.tool_args["query"] == "Saved"
+
+
+@pytest.mark.asyncio
+async def test_read_only_observers_do_not_dirty_the_window() -> None:
+    # zoom / list_windows / get_desktop_state neither mutate the window nor
+    # replace the element cache, so they must not cost the model its filter.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "zoom", win, "✅ zoomed")
+    await _observe(rail, "list_windows", {}, "✅ windows")
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+
+    assert ctx.inputs.tool_args["query"] == "Save"
+
+
+@pytest.mark.asyncio
+async def test_windows_are_tracked_independently() -> None:
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {"pid": 3, "window_id": 4, "element_index": 1}, "✅ ok")
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+
+    # Acting on window (3,4) does not turn (1,2)'s next snapshot into a verify.
+    assert ctx.inputs.tool_args["query"] == "Save"
+
+
+@pytest.mark.asyncio
+async def test_freshness_resets_between_invokes() -> None:
+    # A new invoke starts with no window history at all, so the first filtered
+    # snapshot of any window is discovery again.
+    rail = CuaSnapshotFreshnessRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    await _observe(rail, "get_window_state", win, "✅ tree")
+    await _observe(rail, "click", {**win, "element_index": 7}, "✅ clicked")
+    await rail.before_invoke(_ctx())
+    ctx = await _snapshot_round_trip(rail, {**win, "query": "Save"})
+
+    assert ctx.inputs.tool_args["query"] == "Save"
+
+
+# --- CuaProgressRail ---------------------------------------------------
+
+
+async def _snap(rail, tool_short, args, content):
+    """Feed one completed cua driver call through the rail under test."""
+    ctx = _result_ctx("mcp_cua-driver_" + tool_short, dict(args), content)
+    await rail.after_tool_call(ctx)
+    return ctx
+
+
+_WIN_A = "\u2705 Window state\n[element_index 1] Button 'A'\n[element_index 2] Button 'B'"
+_WIN_B = "\u2705 Window state\n[element_index 1] Button 'C'\n[element_index 2] Button 'D'"
+
+
+class _FakeSession:
+    """Minimal dict-backed session double: enough for get_state/update_state."""
+
+    def __init__(self) -> None:
+        self._state: dict = {}
+
+    def get_state(self, key):
+        return self._state.get(key)
+
+    def update_state(self, patch: dict) -> None:
+        self._state.update(patch)
+
+
+def _invoke_ctx(session=None) -> SimpleNamespace:
+    return SimpleNamespace(agent=MagicMock(), session=session or _FakeSession())
+
+
+def _after_invoke_ctx(result: dict, session=None) -> SimpleNamespace:
+    inputs = SimpleNamespace(result=result)
+    return SimpleNamespace(inputs=inputs, session=session or _FakeSession())
+
+
+@pytest.mark.asyncio
+async def test_revisit_advisory_fires_after_the_configured_threshold() -> None:
+    # Three occurrences of the same content (the digest itself, not
+    # necessarily consecutive turns) is the current, provisional threshold.
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    ctxs = [await _snap(rail, "get_window_state", win, _WIN_A) for _ in range(3)]
+
+    assert "cycling" not in ctxs[0].inputs.tool_msg.content
+    assert "cycling" not in ctxs[1].inputs.tool_msg.content
+    assert "cycling" in ctxs[2].inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_revisit_detection_survives_a_different_intervening_state() -> None:
+    # The gap this rail closes: comparing a snapshot only to the one
+    # immediately before it never catches A -> B -> A (A != B each time).
+    # This rail keeps a short history per window, so the THIRD visit to A is
+    # still caught even with B in between.
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+
+    ctxs = []
+    for content in (_WIN_A, _WIN_B, _WIN_A, _WIN_B, _WIN_A):
+        ctxs.append(await _snap(rail, "get_window_state", win, content))
+
+    assert all("cycling" not in c.inputs.tool_msg.content for c in ctxs[:4])
+    assert "cycling" in ctxs[4].inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_windows_are_tracked_independently_for_revisits() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+
+    ctxs_a = [await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A) for _ in range(3)]
+    ctxs_b = [await _snap(rail, "get_window_state", {"pid": 3, "window_id": 4}, _WIN_A) for _ in range(2)]
+
+    assert "cycling" in ctxs_a[2].inputs.tool_msg.content
+    assert all("cycling" not in c.inputs.tool_msg.content for c in ctxs_b)
+
+
+@pytest.mark.asyncio
+async def test_current_window_tracks_the_latest_snapshot() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await _snap(rail, "get_window_state", {"pid": 9, "window_id": 10}, _WIN_B)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["current_window"] == {"pid": 9, "window_id": 10}
+
+
+@pytest.mark.asyncio
+async def test_blockers_accumulate_for_non_success_action_responses() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    ctx = _result_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"}, _FAILURE)
+    await rail.after_tool_call(ctx)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == [f"type_text: {_FAILURE}"]
+
+
+@pytest.mark.asyncio
+async def test_unverified_action_responses_are_not_blockers() -> None:
+    # No ✅ and no ❌: the action ran but the driver could not verify it.
+    # That is not a failure to report to a parent; only the failure marker is.
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_press_key", {"pid": 1, "key": "tab"}, _UNVERIFIED))
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_freshness_neutral_responses_are_never_blockers() -> None:
+    # get_window_state and read-only observers never carry the driver's
+    # success marker even when they succeed, so they must be excluded from
+    # blocker detection or every successful snapshot would look "blocked".
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_list_windows", {}, "pid=1 title=Notepad"))
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["blockers"] == []
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_writes_cua_result_onto_the_answer_payload() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await rail.after_tool_call(_result_ctx("mcp_cua-driver_type_text", {"pid": 1}, _FAILURE))
+
+    result: dict = {"output": "partial progress"}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    cua_result = result["cua_result"]
+    assert cua_result["status"] == "partial"
+    assert cua_result["current_window"] == {"pid": 1, "window_id": 2}
+    assert cua_result["blockers"] == [f"type_text: {_FAILURE}"]
+    assert cua_result["recommended_recovery"]
+    assert cua_result["resume_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_status_is_blocked_when_a_revisit_was_flagged() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+    win = {"pid": 1, "window_id": 2}
+    for _ in range(3):
+        await _snap(rail, "get_window_state", win, _WIN_A)
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "blocked"
+    assert result["cua_result"]["revisit_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_status_is_completed_with_no_signals() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    await rail.before_invoke(_invoke_ctx())
+
+    result: dict = {"output": "done"}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "completed"
+    assert result["cua_result"]["recommended_recovery"] is None
+
+
+@pytest.mark.asyncio
+async def test_after_invoke_ignores_a_non_dict_result() -> None:
+    # Mirrors every other rail in this file: an optional signal must never
+    # raise into the run.
+    rail = CuaProgressRail(_mcp_cfg())
+    ctx = SimpleNamespace(inputs=SimpleNamespace(result=None), session=_FakeSession())
+
+    await rail.after_invoke(ctx)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_resume_count_increments_across_invocations_on_the_same_session() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    session = _FakeSession()
+
+    first_result: dict = {"output": "1"}
+    await rail.before_invoke(_invoke_ctx(session))
+    await rail.after_invoke(_after_invoke_ctx(first_result, session))
+
+    second_result: dict = {"output": "2"}
+    await rail.before_invoke(_invoke_ctx(session))
+    await rail.after_invoke(_after_invoke_ctx(second_result, session))
+
+    assert first_result["cua_result"]["resume_count"] == 1
+    assert second_result["cua_result"]["resume_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_progress_state_resets_between_invokes() -> None:
+    rail = CuaProgressRail(_mcp_cfg())
+    win = {"pid": 1, "window_id": 2}
+    await _snap(rail, "get_window_state", win, _WIN_A)
+    await _snap(rail, "get_window_state", win, _WIN_A)
+
+    await rail.before_invoke(_invoke_ctx())
+
+    ctx = await _snap(rail, "get_window_state", win, _WIN_A)
+    assert "cycling" not in ctx.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_failure_hard_block_reports_the_run_as_blocked() -> None:
+    # A run CuaRepeatFailureRail cut off after N identical failures used to
+    # reach after_invoke with only ordinary blockers recorded, so the parent
+    # saw status="partial" and treated it as merely incomplete. A hard block
+    # means the model was thrashing on a step it cannot complete this way:
+    # that is a terminal signal and must surface as "blocked".
+    repeat = CuaRepeatFailureRail(_mcp_cfg(), advise_after=1, block_after=2)
+    progress = CuaProgressRail(_mcp_cfg())
+    await progress.before_invoke(_invoke_ctx())
+    args = {"pid": 1, "text": "hi"}
+
+    for _ in range(3):
+        ctx = _result_ctx("mcp_cua-driver_type_text", dict(args), _FAILURE)
+        await repeat.before_tool_call(ctx)
+        if not ctx.extra.get("_skip_tool"):
+            await repeat.after_tool_call(ctx)
+        await progress.after_tool_call(ctx)
+    assert ctx.extra.get("_skip_tool")
+
+    result: dict = {"output": "..."}
+    await progress.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "blocked"
+    assert "type_text" in result["cua_result"]["recommended_recovery"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_failures_below_the_block_threshold_stay_partial() -> None:
+    # The counterpart: failures the breaker never tripped on are still just
+    # blockers. Only the hard block upgrades the run to "blocked".
+    repeat = CuaRepeatFailureRail(_mcp_cfg(), advise_after=1, block_after=3)
+    progress = CuaProgressRail(_mcp_cfg())
+    await progress.before_invoke(_invoke_ctx())
+
+    for _ in range(2):
+        ctx = _result_ctx("mcp_cua-driver_type_text", {"pid": 1, "text": "hi"}, _FAILURE)
+        await repeat.before_tool_call(ctx)
+        await repeat.after_tool_call(ctx)
+        await progress.after_tool_call(ctx)
+
+    result: dict = {"output": "..."}
+    await progress.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["status"] == "partial"
