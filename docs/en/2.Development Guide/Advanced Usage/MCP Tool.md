@@ -132,6 +132,7 @@ McpServerConfig contains the following core configuration fields:
 | `params` | dict | Extra parameters (e.g., command/args for StdioServerParameters) |
 | `auth_headers` | dict | HTTP authentication Header (SSE/StreamableHttp only) |
 | `auth_query_params` | dict[str, str] | HTTP authentication Query parameters |
+| `include_structured_content` | bool | Append each tool result's `structuredContent` to the text the model sees (default `False`). The JSON is skipped when it repeats the text, and capped at 4000 characters. Enable it for servers that put data only in `structuredContent`, such as cua-driver window bounds |
 
 ### 4.1 SSE-Based Remote Service Integration
 

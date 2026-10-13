@@ -132,6 +132,7 @@ McpServerConfig 包含以下核心配置项：
 | `params` | dict | 额外参数（如 StdioServerParameters 的 command/args） |
 | `auth_headers` | dict | HTTP认证Header（仅SSE/StreamableHttp） |
 | `auth_query_params` | dict[str, str] | HTTP认证Query参数 |
+| `include_structured_content` | bool | 将工具结果的 `structuredContent` 追加到模型可见文本（默认 `False`）。与文本重复时不追加，超过 4000 字符时截断。适用于只在 `structuredContent` 中返回数据的服务器，例如 cua-driver 的窗口坐标 |
 
 ### 4.1 基于 SSE 的远程服务对接
 

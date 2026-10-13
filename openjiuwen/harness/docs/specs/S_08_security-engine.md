@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/security/`（14 文件）、`openjiuwen/harness/rails/security/` |
-| 最近一次修订日期 | 2026-08-23 |
-| 关联 feature | N/A |
+| 最近一次修订日期 | 2026-10-14 |
+| 关联 feature | F_22_cua-desktop-subagent |
 
 ## 范围 / 边界
 
@@ -57,7 +57,8 @@
    解析（`security/shell_ast.py`）是**唯一**从命令文本抽路径的途径。
 6. **层级策略**：`tiered_policy.get_builtin_security_rules()` 从内置 YAML（`resources/
    builtin_rules.yaml` 同类机制）读取规则；`severity_to_decision(severity, permission_mode)`
-   把严重度折成 `PermissionLevel`；`_tool_category` 给工具分类。内置规则路径经
+   把严重度折成 `PermissionLevel`；`_tool_category` 给工具分类（`shell` / `path` /
+   `network` / `os_control`，其余工具无类别）。内置规则路径经
    `get_package_builtin_rules_path()` 解析。
 7. **宿主接口**：`ToolPermissionHost` 是工具的权限宿主协议；`RequestPermissionConfirmationHook`
    （`PermissionSceneHookInput` → `PermissionConfirmationResult`）是确认回调契约；
@@ -65,6 +66,14 @@
 8. **到 rail 的桥唯一**：`security/factory.py:build_permission_interrupt_rail(...)` 构造
    `PermissionInterruptRail`；`deep_agent.py` 的 `build_permission_interrupt_rail` 导入路径
    一致。安全 rail 特性（`supported_events` / 静默降级）见 `S_04` 不变量 8。
+9. **桌面控制类别 `os_control`**：`toolguard/tool_policy.py` 的 `_OS_CONTROL_TOOLS` 按模型可见的
+   MCP 名（`mcp_cua-driver_<tool>`）列出 cua-driver 的 12 个变更型桌面工具（点击、拖拽、键盘输入、
+   `set_value`、`scroll`、`launch_app`、`kill_app`、`bring_to_front`）。只读观察工具不归类，由
+   defaults 决定。`os_control` 规则的 `pattern` 为 `*` 时匹配该工具的任何调用；其他 pattern
+   （精确 / glob / `re:`）匹配参数 `text` / `name` / `bundle_id` / `value` / `key` / `keys`
+   中的字符串（列表参数以空格拼接后匹配）。名单按默认 server_name `cua-driver` 书写；
+   `cua_instance_key` 非空时工具名为 `mcp_cua-driver-<key>_<tool>`，`_canonical_os_control_tool`
+   将其映射回 `mcp_cua-driver_<tool>` 后再判定类别和内置规则，因此实例隔离不会绕过这些规则。
 
 ## 接口契约
 
@@ -134,6 +143,16 @@ def write_permissions_section_to_agent_config_yaml(...) -> None
 | 外部路径 | `ExternalDirectoryChecker.check_external_paths` | 放行集 / 拒绝 |
 | 内置规则 | `tiered_policy` YAML | `severity → PermissionLevel` |
 | 宿主确认 | `RequestPermissionConfirmationHook` | `PermissionConfirmationResult` |
+
+### 内置 os_control 规则（`resources/builtin_rules.yaml`）
+
+| id | 工具 | severity | action |
+|---|---|---|---|
+| `cua_desktop_force_terminate_app` | `mcp_cua-driver_kill_app` | CRITICAL | deny |
+| `cua_desktop_launch_app` | `mcp_cua-driver_launch_app` | HIGH | ask |
+| `cua_desktop_type_text` | `mcp_cua-driver_type_text` | HIGH | ask |
+
+三条规则都用 `pattern: "*"`，仅在权限引擎启用时生效。
 
 ## 与其它 spec 的关系
 

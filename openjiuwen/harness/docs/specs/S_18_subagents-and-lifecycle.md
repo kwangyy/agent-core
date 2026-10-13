@@ -5,9 +5,9 @@
 | 项 | 值 |
 |---|---|
 | 类型 | spec |
-| 关联模块 | `openjiuwen/harness/subagents/`（8 文件）、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-10-12 |
-| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit |
+| 关联模块 | `openjiuwen/harness/subagents/`（9 文件）、`openjiuwen/harness/tools/cua/`、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
+| 最近一次修订日期 | 2026-10-14 |
+| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-driver-self-launch、F_22_cua-desktop-subagent |
 
 ## 范围 / 边界
 
@@ -15,13 +15,15 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
 [浏览器子智能体](../../../../docs/zh/2.开发指南/API文档/openjiuwen.harness/subagents/浏览器子智能体.md)。
 本 spec 保留生命周期不变量；统一说明包含本地未提交实现，不表示已发布版本全部支持。
 
-本规约定义 harness 的**预设子代理**及其生命周期辅助：五类预置 agent 的配置构建、
+本规约定义 harness 的**预设子代理**及其生命周期辅助：六类预置 agent 的配置构建、
 创建、任务资源生命周期。`S_10` 是异步运行时（状态机 / 容量 / snapshot），本 spec 是
 预设的**声明 + 创建 + 同步生命周期**。
 
 具体覆盖：
 
 - `subagents/browser_agent.py`：`build_browser_agent_config` / `create_browser_agent`。
+- `subagents/cua_agent.py`：`build_cua_agent_config` / `create_cua_agent`；其 driver 配置、
+  capability 目录与 rails 位于 `tools/cua/`（见下文「cua 桌面子代理」）。
 - `subagents/code_agent.py`：`build_code_agent_config` / `create_code_agent`。
 - `subagents/research_agent.py`：`build_research_agent_config` / `create_research_agent`。
 - `subagents/verification_agent.py`：`build_verification_agent_config` /
@@ -31,7 +33,7 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
 - `subagents/explore_agent.py` / `plan_agent.py`：explore / plan 预设（`S_12` 的
   `build_explore_subagent` / `build_plan_subagent` 消费）。
 - `subagent_lifecycle.py`：`prepare_subagent_task_resources` / `cleanup_subagent_task_resources`。
-- `subagents/__init__.py` 导出面（`__all__` 10 符号）。
+- `subagents/__init__.py` 导出面（`__all__` 12 符号）。
 
 不在本规约范围内：
 - 异步运行时（spawn/wait/status/snapshot）—— `S_10`。
@@ -40,11 +42,11 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
 
 ## 不变量
 
-1. **五类预设 + 两个辅助**：预设 agent 共 5 类——browser / code / research /
-   verification / mobile_gui；辅助 preset 由 manifest 的 `build_explore_subagent` /
+1. **六类预设 + 辅助 preset**：预设 agent 共 6 类——browser / code / research /
+   verification / mobile_gui / cua；辅助 preset 由 manifest 的 `build_explore_subagent` /
    `build_plan_subagent` / `build_general_purpose_subagent` 提供。每类有
    `build_*_agent_config`（纯配置）+ `create_*_agent`（实例化）成对 API。
-2. **`subagents/__init__.py` 的 `__all__` 是公开面**（10 个 build/create 函数）；
+2. **`subagents/__init__.py` 的 `__all__` 是公开面**（12 个 build/create 函数）；
    辅助 preset 不在 `__all__`（走 `manifest` catal登记，`S_12`）。
 3. **配置构建是纯函数**：`build_*_agent_config` 不含副作用、只读输入
    （`model` / `subagents` / `workspace` 等），产出 `SubAgentConfig`（`S_01` 配置形态）；
@@ -130,6 +132,12 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
     墙钟耗时，模型耗时合计不含工具并可能含 shadow 重叠。续跑每次单独统计，不能把每段当作任务累计值。
     计量只读写独立 session 统计，不参与策略、预算、工具派发或完成判断。
 
+17. **cua 工具面由可信目录决定**：`create_cua_agent` / `build_cua_agent_config` 在构建期经
+    `resolve_cua_capabilities` 校验 `cua_capabilities`；未知名称、非法 `cua_delivery_mode`、
+    `cua_snapshot_keep_last_k < 1` 都在构建期抛 `ValueError`，不拖到首次工具调用。解析结果是
+    driver MCP server 上唯一的工具白名单（`CuaRuntimeRail` 调 `set_mcp_tool_allowlist`）；
+    driver 新增工具不会因前缀匹配自动暴露。完整契约见下文「cua 桌面子代理」。
+
 ## Browser 运行时减法（F_17，当前契约）
 
 阶段计数、自然语言验收和可选条件只提供诊断，不阻断一般动作。删除阶段次数上限、
@@ -167,6 +175,14 @@ def build_verification_agent_config(...) -> SubAgentConfig
 def create_verification_agent(...) -> DeepAgent
 def build_mobile_gui_agent_config(...) -> SubAgentConfig
 def create_mobile_gui_agent(...) -> DeepAgent
+def build_cua_agent_config(model, *, ..., cua_capabilities=None, cua_instance_key="",
+                           cua_delivery_mode=None, cua_screenshot_multimodal=False,
+                           cua_snapshot_keep_last_k=3, cua_pause_on_user_input=False,
+                           permissions=None, permission_host=None) -> SubAgentConfig
+def create_cua_agent(model, *, ..., cua_capabilities=None, cua_instance_key="",
+                     cua_delivery_mode=None, cua_screenshot_multimodal=False,
+                     cua_snapshot_keep_last_k=3, cua_pause_on_user_input=False,
+                     **config_kwargs) -> DeepAgent
 
 # subagent_lifecycle.py
 async def prepare_subagent_task_resources(subagent: Any) -> None
@@ -190,6 +206,7 @@ async def cleanup_subagent_task_resources(subagent: Any) -> None
 | research | `build_research_agent_config` | `create_research_agent` | 研究工具组 |
 | verification | `build_verification_agent_config` | `create_verification_agent` | 验证 rail / 工具 |
 | mobile_gui | `build_mobile_gui_agent_config` | `create_mobile_gui_agent` | GUI 操作工具组 |
+| cua | `build_cua_agent_config` | `create_cua_agent` | cua-driver stdio MCP、capability 白名单、cua rails、快照窗口 |
 | explore / plan / general_purpose | manifest `build_*_subagent` | （经 catalog） | 探索 / 计划 / 通用 |
 
 ### 生命周期钩子
@@ -201,8 +218,11 @@ async def cleanup_subagent_task_resources(subagent: Any) -> None
 
 ## 与其它 spec 的关系
 
-- 异步执行进 `S_10` 控制面；spawn 类型名（`"browser_agent"` / `"verification_agent"`）
-  与 `S_16` 的 sticky 白名单一致。
+- 异步执行进 `S_10` 控制面；sticky 白名单（`S_16`，当前仅 `"verification_agent"`）使用
+  本 spec 的预设类型名。`"browser_agent"` / `"cua_agent"` 非 sticky，同一子会话只能经
+  TaskTool 的显式 `resume_task_id` 续跑（`S_05`）。
+- cua 桌面动作的权限类别 `os_control` 与内置规则 —— `S_08`；`MultimodalContextSummarizerRail`
+  的导出与挂载 —— `S_04`。
 - 预设经 `manifest` catalog 注册 —— `S_12`；`SubAgentConfig` / `DeepAgentSpec.subagents`
   字段 —— `S_01`（`SubAgentSpec` 解析成 `SubAgentConfig`，装配见 `S_13`）。
 - `SubagentRail` 挂载 / `create_subagent` 装配 —— `S_04` / `S_02`。
@@ -352,3 +372,72 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 为空不能证明没有页面障碍。父层与 resume 保留同一结果；模型渲染只展示一次结果，避免三份重复投影。
 常用等待使用已有目标/文本/URL 条件；缺目标仍拒绝，旧目标校验、串行派发、权限和真实未知效果保护保留。
 本节取代 F_17 中继续默认维护 inferred 诊断和语义反证的部分，详见 [F_19](../features/F_19_browser-observation-first-results.md)。
+
+## cua 桌面子代理（F_21 / F_22，当前契约）
+
+`cua_agent` 通过 cua-driver 操作本机桌面应用。DeepAgent 的 `create_subagent` 以 factory 名
+`"cua_agent"`（别名 `"desktop_agent"`）分派到 `create_cua_agent`。
+
+**运行时**：`build_cua_driver_mcp_config(instance_key, include_image_content=...)` 生成 stdio
+MCP 配置，启动 `cua-driver mcp` 代理，工具实际在 `cua-driver serve` 守护进程中执行。命令解析
+顺序与守护进程预检见 F_21。该配置恒开 `include_structured_content`，因为窗口坐标和屏幕尺寸
+只出现在 structuredContent 中；`include_image_content` 跟随 `cua_screenshot_multimodal`。
+`cua_instance_key` 非空时 `server_id` / `server_name` 加后缀，用于隔离注册；相同 key（或都为空）
+共享同一 MCP 注册。
+
+**能力目录**（`tools/cua/cua_capabilities.py`）：
+
+| capability | 工具 | 默认授予 |
+|---|---|---|
+| `core` | 只读观察与会话：`list_apps`、`list_windows`、`get_window_state`、`get_accessibility_tree`、`get_desktop_state`、`get_screen_size` 等 13 个 | 总是包含 |
+| `input` | `click`、`double_click`、`right_click`、`drag`、`type_text`、`press_key`、`hotkey`、`scroll`、`set_value` | 是 |
+| `app_lifecycle` | `launch_app`、`bring_to_front` | 是 |
+| `app_termination` | `kill_app` | 否，需显式请求；内置规则拒绝 `kill_app`，授予时提示词才追加其使用指引 |
+| `recording` | `start_recording`、`stop_recording`、`get_recording_state`、`replay_trajectory` | 否，需显式请求 |
+
+driver 的浏览器类工具（`browser_*`、`page`、`get_browser_state`）列在 `BROWSER_CUA_TOOL_NAMES`
+中，但不属于任何 capability：网页任务归 browser_agent。
+
+**注入 rails**（追加在调用方 rails 之后，默认 priority 50，按下列顺序）：
+
+| rail | 条件 | 职责 |
+|---|---|---|
+| `CuaRuntimeRail` | 总是 | 守护进程预检、注册 MCP 能力并施加白名单、声明一次 driver session；各步只缓存成功 |
+| `CuaElementAddressingRail` | 总是 | 调用同时带 `element_index` 与 `x`/`y` 时丢弃像素坐标 |
+| `CuaRepeatFailureRail` | 总是 | 相同调用 + 相同非成功响应：第 3 次附加建议，第 6 次在派发前拒绝 |
+| `CuaSnapshotFreshnessRail` | 总是 | 对窗口操作后的第一次快照去掉 `query`，并在结果中说明 |
+| `CuaProgressRail` | 总是 | 状态回访检测（第 3 次附加建议），`after_invoke` 写 `result["cua_result"]` |
+| `CuaDeliveryModeRail` | `cua_delivery_mode` 非空 | 固定 `delivery_mode`；background 模式下拒绝显式 foreground |
+| `CuaUserTakeoverRail` | `cua_pause_on_user_input=True` | 用户在操作桌面时暂缓 driver 调用；无探针的平台上不生效 |
+| `CuaScreenshotDownscaleRail` | multimodal | 超出图像 token 预算的截图重编码为 JPEG，并附缩放系数说明 |
+| `MultimodalContextSummarizerRail` | multimodal | 只保留最近 `cua_snapshot_keep_last_k` 张截图 |
+| `ContextProcessorRail`（`ToolResultWindowProcessor`） | 调用方未自带 `ContextProcessorRail` | `get_window_state` / `get_desktop_state` / `get_accessibility_tree` 只保留最近 `cua_snapshot_keep_last_k` 个结果，旧结果 offload 后留 200 字符预览 |
+
+各 rail 拒绝调用时统一走 `ctx.extra["_skip_tool"]` 契约（`S_04`）。成功 / 失败判断依赖 driver 响应
+文本首字符：`✅` 为确认成功，`❌` 为确认失败，两者都没有表示已执行但未验证。
+
+**感知模式**：`cua_screenshot_multimodal=False`（默认）为文本模式，默认提示词声明截图永远不会
+交付，模型只凭元素树决策；`True` 时截图作为图像进入上下文（需视觉模型），提示词保留截图读坐标
+与边缘留白指引。调用方传入 `system_prompt` 时替换默认提示词，但 `cua_delivery_mode` 非空时
+仍会追加对应的投递覆盖后缀。
+
+**权限**：`build_cua_agent_config` 仅在传入时把 `permissions` / `permission_host` 写进
+`factory_kwargs`。task_tool 委派内 ASK 中断无法到达外层对话，需要 ASK 的策略须配
+`ToolPermissionHost.request_permission_confirmation` 在进程内应答；DENY 规则无需宿主。
+桌面动作的内置规则见 `S_08`。
+
+**结果与续跑**：`CuaProgressRail` 写入 `cua_result`：
+
+| 字段 | 语义 |
+|---|---|
+| `status` | `blocked`（重复失败被硬拒绝，或状态回访达到阈值）/ `partial`（有 `❌` 失败）/ `completed` |
+| `current_window` | 最近一次快照的 `{pid, window_id}` |
+| `blockers` | 最多 5 条 `工具名: 失败首行` |
+| `revisit_count` | 单一状态的最大回访次数 |
+| `recommended_recovery` | 续跑提示；`completed` 时为 `None` |
+| `resume_count` | 经 session state 累计的本子会话运行次数 |
+
+`status` 是启发式判断，不是权威的任务完成判定。TaskTool 将其转成 `resume_context`、计算
+`retryable`、处理超时和续跑，契约见 `S_05`。
+
+**平台**：只在 Windows 上实测；用户活动探针（`GetLastInputInfo`）也仅 Windows 可用。

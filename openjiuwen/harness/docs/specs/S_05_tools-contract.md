@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/tools/`（130 文件）、`openjiuwen/harness/schema/task.py`、`openjiuwen/core/foundation/tool/base.py`（`Tool.render_for_llm`） |
-| 最近一次修订日期 | 2026-10-08 |
-| 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop |
+| 最近一次修订日期 | 2026-10-13 |
+| 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_22_cua-desktop-subagent |
 
 ## 范围 / 边界
 
@@ -196,6 +196,7 @@ def create_audio_tools(...) -> list[Tool]
 def create_todos_tool(...) -> list[Tool]
 def create_cron_tools(...) -> list[Tool]
 def create_task_tool(...) -> Tool
+def resolve_subagent_task_timeout_s() -> float   # tools/subagent/task_tool.py
 def build_session_tools(...) -> list[Tool]
 def is_free_search_enabled() -> bool
 def is_paid_search_enabled() -> bool
@@ -426,3 +427,28 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 为空不能证明没有页面障碍。父层与 resume 保留同一结果；模型渲染只展示一次结果，避免三份重复投影。
 常用等待使用已有目标/文本/URL 条件；缺目标仍拒绝，旧目标校验、串行派发、权限和真实未知效果保护保留。
 本节取代 F_17 中继续默认维护 inferred 诊断和语义反证的部分，详见 [F_19](../features/F_19_browser-observation-first-results.md)。
+
+## TaskTool cua 委派与续跑（F_22，当前契约）
+
+- **委派上限可配**：task_tool 卡片的 `resilience.timeout_s` 取 `resolve_subagent_task_timeout_s()`：
+  环境变量 `OPENJIUWEN_SUBAGENT_TASK_TIMEOUT_S` 为正数时用它，否则用 `DEFAULT_SUBAGENT_TASK_TIMEOUT_S`
+  （720 秒）；非法值记 warning 后回退默认。
+- **显式续跑类型**：`browser_agent` 与 `cua_agent` 都非 sticky（`S_16`），只有它们接受
+  `resume_task_id`；值必须以 `{parent_session_id}_sub_{subagent_type}_` 开头，否则拒绝。其他类型
+  传入 `resume_task_id` 报 `TOOL_TASK_TOOL_INVOKED`。
+- **结果映射**：cua_agent 的返回 data 总带 `resume_task_id`。子代理结果中存在
+  `cua_result`（`CuaProgressRail` 写入，`S_18`）时，另带 `cua_result`、`retryable`
+  （`status != "completed"`）和 `resume_context`（`status` / `blockers` / `current_window` /
+  `recommended_recovery` / `resume_count`）。`resume_context` 按 sub_session_id 存入父 session
+  state `__cua_delegation_state__`。
+- **超时可续跑**：cua 委派在 `max(上限 - 20, 上限 × 0.5)` 秒时由 TaskTool 自行取消，先于
+  AbilityManager 的硬超时。取消后返回 `success=True` 的 ToolOutput：`status="timeout"`、
+  `retryable=True`、`resume_context.last_action_confirmed=False`，并说明取消时正在执行的动作可能
+  已生效但未记录。不抛超时错误，已完成的步骤不丢失。
+- **聚焦续跑**：带 `resume_task_id` 的 cua 调用，若父 session 中有该子会话的记录，任务描述改写为
+  「上次状态 / 最后窗口 / blockers / 恢复提示 + Remaining task」。上次为 `timeout` 时要求先
+  重新快照并确认中断的动作是否已生效，再决定是否重做；无记录时描述原样传递。续跑时子代理输入带
+  `run.context.extra = {"cua_resume": True, "resume_task_id": ...}`。
+- `SubagentRail` 给 cua_agent 的工具摘要为 `list_apps, list_windows, get_window_state, click,
+  type_text, press_key, hotkey, scroll, launch_app`；task_tool 提示词说明 cua 超时后用同一
+  `resume_task_id` 续跑、只描述剩余部分。
