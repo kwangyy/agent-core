@@ -17,7 +17,6 @@ import asyncio
 import base64
 import json
 import os
-import shutil
 import sys
 import threading
 import time
@@ -340,7 +339,7 @@ def _hotkey(desktop: CuaDesktop, args: dict) -> ToolOutput:
     return _ok(f"Pressed {'+'.join(keys)}{_where(win)}.")
 
 
-def _launch_argv(args: dict) -> tuple[list[str], str]:
+def _launch_argv(backend: DesktopBackend, args: dict) -> tuple[list[str], str]:
     extra = _string_list(args, "additional_arguments")
     path = args.get("path")
     if path:
@@ -353,7 +352,7 @@ def _launch_argv(args: dict) -> tuple[list[str], str]:
     name = args.get("name") or args.get("bundle_id")
     if not name:
         raise CuaToolError("Provide name, path or aumid.")
-    resolved = shutil.which(str(name))
+    resolved = backend.which(str(name))
     if resolved is not None:
         return [resolved, *extra], str(name)
     if sys.platform == "win32" and ":" in str(name):
@@ -364,8 +363,8 @@ def _launch_argv(args: dict) -> tuple[list[str], str]:
 
 
 def _launch_app(desktop: CuaDesktop, args: dict) -> ToolOutput:
-    argv, label = _launch_argv(args)
     backend = desktop.backend
+    argv, label = _launch_argv(backend, args)
     before = {w.window_id for w in backend.list_windows()}
     pid = backend.launch(argv)
     # The launched process is often a stub (Win11 notepad/calc, explorer for an

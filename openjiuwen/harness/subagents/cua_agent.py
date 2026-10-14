@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.context_engine import ToolResultWindowProcessorConfig
@@ -24,6 +24,7 @@ from openjiuwen.harness.tools.cua.cua_capabilities import (
     DEFAULT_CUA_CAPABILITIES,
     resolve_cua_capabilities,
 )
+from openjiuwen.harness.tools.cua.backend import DesktopBackend
 from openjiuwen.harness.tools.cua.desktop_tools import CuaDesktop, build_cua_desktop_tools
 from openjiuwen.harness.tools.cua.rails import (
     CuaProgressRail,
@@ -310,6 +311,7 @@ def create_cua_agent(
     cua_instance_key: str = "",
     cua_snapshot_keep_last_k: int = 3,
     cua_pause_on_user_input: bool = False,
+    cua_backend_factory: Optional[Callable[[], DesktopBackend]] = None,
     **config_kwargs: Any,
 ) -> DeepAgent:
     """Create the cua desktop subagent with a task-scoped tool allowlist.
@@ -338,6 +340,10 @@ def create_cua_agent(
     default for now (opt in per agent); inert on hosts without a user-activity
     probe.
 
+    ``cua_backend_factory`` builds the desktop the tools act on, in place of
+    this host's own (Windows or X11) backend: for example a backend that
+    drives a remote VM. It is called once, on first use.
+
     ``cua_snapshot_keep_last_k`` is how many recent captures stay in context:
     it drives both the tool-result window on the capture tools and the number
     of retained screenshot images. Tasks that juggle two windows need both
@@ -358,7 +364,7 @@ def create_cua_agent(
         config_kwargs["permissions"] = _with_cua_permission_rules(config_kwargs["permissions"])
 
     resolved_language = resolve_language(language)
-    desktop = CuaDesktop()
+    desktop = CuaDesktop(cua_backend_factory) if cua_backend_factory is not None else CuaDesktop()
     cua_tools = build_cua_desktop_tools(desktop, names=resolved_capabilities.allowed_tool_names)
 
     final_card = card or AgentCard(

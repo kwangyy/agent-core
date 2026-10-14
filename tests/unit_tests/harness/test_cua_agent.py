@@ -90,6 +90,17 @@ def test_the_preflight_probes_the_desktop_the_tools_use() -> None:
     assert all(tool._desktop is runtime._desktop for tool in _cua_tools(agent).values())
 
 
+def test_a_caller_backend_factory_replaces_the_host_desktop() -> None:
+    """A caller driving a remote VM must never fall through to the host's own
+    mouse and keyboard: the tools and the preflight both use its backend."""
+    remote = object()
+    agent = create_cua_agent(_create_dummy_model(), language="en", cua_backend_factory=lambda: remote)
+
+    [runtime] = [rail for rail in agent._pending_rails if isinstance(rail, CuaRuntimeRail)]
+    assert runtime._desktop.backend is remote
+    assert all(tool._desktop.backend is remote for tool in _cua_tools(agent).values())
+
+
 def test_every_agent_gets_its_own_desktop_tools() -> None:
     # Two agents in one process must not share zoom state or tool instances;
     # this is also why cua_instance_key has nothing left to isolate.

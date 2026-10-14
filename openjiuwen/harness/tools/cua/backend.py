@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -98,6 +99,9 @@ class DesktopBackend(Protocol):
 
     def hotkey(self, keys: Sequence[str]) -> None:
         """Press ``keys`` together, released in reverse order."""
+
+    def which(self, name: str) -> str | None:
+        """Full path of executable ``name`` on this desktop's PATH, or None."""
 
     def launch(self, args: Sequence[str]) -> int:
         """Start a process; returns its pid."""
@@ -218,6 +222,9 @@ class PyAutoGuiBackend(DesktopBackend):
 
     def hotkey(self, keys: Sequence[str]) -> None:
         self._gui.hotkey(*[normalize_key(k) for k in keys])
+
+    def which(self, name: str) -> str | None:
+        return shutil.which(name)
 
     def launch(self, args: Sequence[str]) -> int:
         # Not a ``with`` block: the launched app must outlive this call.

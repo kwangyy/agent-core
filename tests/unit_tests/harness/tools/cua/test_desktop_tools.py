@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import os
+import shutil
 import struct
 import sys
 import zlib
@@ -106,6 +107,9 @@ class _FakeBackend:
 
     def hotkey(self, keys):
         self.calls.append(("hotkey", list(keys)))
+
+    def which(self, name):
+        return shutil.which(name)
 
     def launch(self, args):
         self.calls.append(("launch", list(args)))
@@ -325,6 +329,20 @@ async def test_launch_app_reports_the_pid_that_owns_the_new_window(monkeypatch) 
     assert ("launch", ["C:/bin/notepad.exe"]) in backend.calls
     assert "(pid 4321)" in result.data["content"]
     assert '"window_id": 9' in result.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_launch_app_resolves_the_name_on_the_backend_desktop(monkeypatch) -> None:
+    """A backend for another machine (a VM) has its own PATH; the host's must not decide."""
+    backend = _FakeBackend([])
+    backend.launched_windows = [_window(9, 77)]
+    backend.which = lambda name: f"/usr/bin/{name}"
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    result = await _call(backend, "launch_app", name="gimp")
+
+    assert result.success
+    assert ("launch", ["/usr/bin/gimp"]) in backend.calls
 
 
 @pytest.mark.asyncio
