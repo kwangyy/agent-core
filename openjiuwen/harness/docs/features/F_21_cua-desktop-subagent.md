@@ -165,7 +165,8 @@ rewritten.
 
 ## Rejected alternatives
 
-- **Accessibility-tree perception.** Element trees give exact targets on
+- **Accessibility-tree perception** (since added as an opt-in second track,
+  see F_22). Element trees give exact targets on
   native widgets but differ per toolkit, come back empty or lazy on
   Chromium/Electron surfaces, and need native UI-automation dependencies per
   platform. Screenshots plus pixels work the same on every window and

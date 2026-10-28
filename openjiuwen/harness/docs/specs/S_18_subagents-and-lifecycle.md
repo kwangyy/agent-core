@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/subagents/`（9 文件）、`openjiuwen/harness/tools/cua/`、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-10-14 |
-| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-desktop-subagent |
+| 最近一次修订日期 | 2026-10-28 |
+| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-desktop-subagent、F_22_cua-accessibility-tree |
 
 ## 范围 / 边界
 
@@ -387,6 +387,7 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 | `core` | `list_windows`、`list_apps`、`get_window_state`、`zoom`、`get_screen_size`、`get_cursor_position` | 总是包含 |
 | `input` | `click`、`double_click`、`right_click`、`move_cursor`、`drag`、`scroll`、`type_text`、`press_key`、`hotkey` | 是 |
 | `app_lifecycle` | `launch_app`、`bring_to_front` | 是 |
+| `accessibility` | `list_accessible_windows`、`get_accessibility_tree`、`invoke`、`set_value` | 否，需显式请求（Linux 需系统 AT-SPI 包）；授予时提示词才追加无障碍树指引 |
 | `app_termination` | `kill_app` | 否，需显式请求；cua 权限规则拒绝 `kill_app`，授予时提示词才追加其使用指引 |
 
 **注入 rails**（追加在调用方 rails 之后，默认 priority 50，按下列顺序）。cua rails 以前缀 `""`
@@ -400,19 +401,21 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 | `CuaScreenshotDownscaleRail` | 总是 | 超出图像 token 预算的截图重编码为 JPEG，并附缩放系数说明 |
 | `MultimodalContextSummarizerRail` | 总是 | 只保留最近 `cua_snapshot_keep_last_k` 张截图 |
 | `CuaUserTakeoverRail` | `cua_pause_on_user_input=True` | 用户在操作桌面时暂缓 cua 工具调用；Windows 用 `GetLastInputInfo`，X11 用 MIT-SCREEN-SAVER，无探针时不生效 |
-| `ContextProcessorRail`（`ToolResultWindowProcessor`） | 调用方未自带 `ContextProcessorRail` | `get_window_state` / `zoom` 只保留最近 `cua_snapshot_keep_last_k` 个结果，旧结果 offload 后留 200 字符预览 |
+| `ContextProcessorRail`（`ToolResultWindowProcessor`） | 调用方未自带 `ContextProcessorRail` | `get_window_state` / `zoom` / `get_accessibility_tree` 只保留最近 `cua_snapshot_keep_last_k` 个结果，旧结果 offload 后留 200 字符预览 |
 
 各 rail 拒绝调用时统一走 `ctx.extra["_skip_tool"]` 契约（`S_04`）。成功 / 失败判断依赖工具回复
 文本首字符：`✅` 为动作已执行，`❌` 为不能执行。
 
 **提示词**：默认提示词（cn / en）只有一种：说明 `get_window_state` 置前并截图、`x,y` 为最新截图中
 以左上角为原点的像素、`zoom` 与 `from_zoom`、`-32000` 表示最小化、边缘留白、输入是真实输入、
-操作后再截图验证、浏览器任务归 browser_agent 而 Electron 应用属于本代理。调用方传入
+操作后再截图验证、浏览器任务归 browser_agent 而 Electron 应用属于本代理。授予 `accessibility`
+时追加无障碍树指引（`CUA_ACCESSIBILITY_PROMPT_SUFFIX`：别名与 id 不与 window_id 混用、读树后再操作、
+何时改用截图工具），授予 `app_termination` 时再追加 `kill_app` 指引。调用方传入
 `system_prompt` 时替换默认提示词。
 
 **权限**：`build_cua_agent_config` 仅在传入时把 `permissions` / `permission_host` 写进
 `factory_kwargs`。传入 `permissions` 时 `create_cua_agent` 合入 `CUA_PERMISSION_RULES`（`kill_app`
-拒绝，`launch_app` / `type_text` 询问，见 `S_08`）；不传时不启用权限引擎。task_tool 委派内 ASK
+拒绝，`launch_app` / `type_text` / `set_value` 询问，见 `S_08`）；不传时不启用权限引擎。task_tool 委派内 ASK
 中断无法到达外层对话，需要 ASK 的策略须配 `ToolPermissionHost.request_permission_confirmation`
 在进程内应答；DENY 规则无需宿主。
 
@@ -421,7 +424,7 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 | 字段 | 语义 |
 |---|---|
 | `status` | `blocked`（重复失败被硬拒绝）/ `partial`（有 `❌` 失败，或达到迭代上限被截断）/ `completed` |
-| `current_window` | 最近一次 `get_window_state` 的 `{pid, window_id}` |
+| `current_window` | 最近一次 `get_window_state` 的 `{pid, window_id}`，或最近一次 `get_accessibility_tree` 的 `{accessible_window: 别名}` |
 | `blockers` | 最多 5 条 `工具名: 失败首行` |
 | `recommended_recovery` | 续跑提示；`completed` 时为 `None` |
 | `resume_count` | 经 session state 累计的本子会话运行次数 |

@@ -170,6 +170,12 @@ The agent sees a window by calling `get_window_state(pid, window_id)`, which bri
 | `type_text`, `press_key`, `hotkey` | Keyboard input to the window; `x,y` clicks a field first |
 | `launch_app`, `bring_to_front` | Start an app (path, executable name, a URI such as `ms-settings:` on Windows, or an AUMID) or front its window |
 | `kill_app` | Force-terminate a process |
+| `list_accessible_windows` | Windows as the accessibility API sees them, named `aw1`, `aw2`, … (`accessibility` capability) |
+| `get_accessibility_tree` | A window's controls as text: one line per element with an id (`e1`, `e2`, …), role, name, value, states and actions |
+| `invoke` | Run an element's action (press, toggle, select, expand, collapse) through the app, not the mouse |
+| `set_value` | Write a field's value through the app, then read it back; fails when the app does not keep it |
+
+The accessibility tools are a separate track. Their window aliases and element ids are unrelated to `list_windows`' `window_id`; element ids are valid until that window's tree is read again. They work on Windows (UI Automation, installed by the `cua` extra) and Linux (AT-SPI: install `python3-pyatspi` and `at-spi2-core` from the system package manager). Their actions do not move the mouse or need the window in front.
 
 A reply starting with `✅` is an action that ran; one starting with `❌` could not run, and no input was sent.
 
@@ -184,6 +190,7 @@ A reply starting with `✅` is an action that ran; one starting with `❌` could
 | `core` | `list_windows`, `list_apps`, `get_window_state`, `zoom`, `get_screen_size`, `get_cursor_position` | Always |
 | `input` | `click`, `double_click`, `right_click`, `move_cursor`, `drag`, `scroll`, `type_text`, `press_key`, `hotkey` | Yes |
 | `app_lifecycle` | `launch_app`, `bring_to_front` | Yes |
+| `accessibility` | `list_accessible_windows`, `get_accessibility_tree`, `invoke`, `set_value` | No |
 | `app_termination` | `kill_app` | No |
 
 Pass `[]` for a read-only agent (core only).
@@ -249,6 +256,7 @@ When you pass `permissions`, `create_cua_agent` adds these rules to a copy of yo
 |---|---|---|
 | `cua_desktop_force_terminate_app` | `kill_app` | Deny |
 | `cua_desktop_launch_app` | `launch_app` | Ask |
+| `cua_desktop_set_value` | `set_value` | Ask |
 | `cua_desktop_type_text` | `type_text` | Ask |
 
 The `kill_app` deny holds even if your policy allows everything, allows `kill_app` by name or adds an approval override for it. Without `permissions`, the agent runs without a permission engine. The rules apply only to this agent; other agents' tools with the same names, such as mobile_gui's `type_text`, are not affected.

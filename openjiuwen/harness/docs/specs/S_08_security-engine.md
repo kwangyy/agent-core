@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/security/`（14 文件）、`openjiuwen/harness/rails/security/` |
-| 最近一次修订日期 | 2026-10-14 |
-| 关联 feature | F_21_cua-desktop-subagent |
+| 最近一次修订日期 | 2026-10-28 |
+| 关联 feature | F_21_cua-desktop-subagent、F_22_cua-accessibility-tree |
 
 ## 范围 / 边界
 
@@ -67,9 +67,9 @@
    `PermissionInterruptRail`；`deep_agent.py` 的 `build_permission_interrupt_rail` 导入路径
    一致。安全 rail 特性（`supported_events` / 静默降级）见 `S_04` 不变量 8。
 9. **桌面控制类别 `os_control`**：`toolguard/tool_policy.py` 的 `_OS_CONTROL_TOOLS` 按模型可见名
-   列出 cua 桌面工具中的 12 个变更型工具（`click` / `double_click` / `right_click` /
+   列出 cua 桌面工具中的 14 个变更型工具（`click` / `double_click` / `right_click` /
    `move_cursor` / `drag` / `type_text` / `press_key` / `hotkey` / `scroll` / `launch_app` /
-   `kill_app` / `bring_to_front`）。只读观察工具不归类，由 defaults 决定。`os_control` 规则的
+   `kill_app` / `bring_to_front` / `invoke` / `set_value`）。只读观察工具不归类，由 defaults 决定。`os_control` 规则的
    `pattern` 为 `*` 时匹配该工具的任何调用；其他 pattern（精确 / glob / `re:`）匹配参数
    `text` / `name` / `bundle_id` / `value` / `key` / `keys` 中的字符串（列表参数以空格拼接后
    匹配）。这些名字是裸名，其他代理也可能有同名工具（如 mobile_gui 的 `type_text`）：类别本身
@@ -151,9 +151,10 @@ def write_permissions_section_to_agent_config_yaml(...) -> None
 |---|---|---|---|
 | `cua_desktop_force_terminate_app` | `kill_app` | CRITICAL | deny |
 | `cua_desktop_launch_app` | `launch_app` | HIGH | ask |
+| `cua_desktop_set_value` | `set_value` | HIGH | ask |
 | `cua_desktop_type_text` | `type_text` | HIGH | ask |
 
-三条规则都用 `pattern: "*"`。调用方给 cua 代理传入 `permissions` 时，`create_cua_agent` 把它们
+四条规则都用 `pattern: "*"`。调用方给 cua 代理传入 `permissions` 时，`create_cua_agent` 把它们
 深拷贝后追加到该配置的 `rules`（调用方的原字典不被修改）；不传 `permissions` 时 cua 代理不启用
 权限引擎。它们以用户层规则合入，不标 `layer: builtin`：带 builtin 层规则的配置会被引擎视为已内联
 包内置规则，从而跳过包内置的 shell 规则。用户层 DENY 先于 `approval_overrides` 与 `tools` /

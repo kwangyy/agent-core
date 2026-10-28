@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/tools/`（130 文件）、`openjiuwen/harness/schema/task.py`、`openjiuwen/core/foundation/tool/base.py`（`Tool.render_for_llm`） |
-| 最近一次修订日期 | 2026-10-14 |
-| 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_21_cua-desktop-subagent |
+| 最近一次修订日期 | 2026-10-28 |
+| 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_21_cua-desktop-subagent、F_22_cua-accessibility-tree |
 
 ## 范围 / 边界
 
@@ -458,10 +458,11 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 - **工具集**：`desktop_tools.build_cua_desktop_tools(desktop, names)` 构建 cua 桌面工具，名字为裸名
   （`list_windows`、`list_apps`、`get_window_state`、`zoom`、`get_screen_size`、
   `get_cursor_position`、`click`、`double_click`、`right_click`、`move_cursor`、`drag`、`scroll`、
-  `type_text`、`press_key`、`hotkey`、`launch_app`、`bring_to_front`、`kill_app`），卡片 id 为
+  `type_text`、`press_key`、`hotkey`、`launch_app`、`bring_to_front`、`list_accessible_windows`、
+  `get_accessibility_tree`、`invoke`、`set_value`、`kill_app`），卡片 id 为
   `tool.cua.<name>`；`names` 之外的工具不构建。同一个 `CuaDesktop` 在这些工具间共享后端与 zoom 原点。
   工具实例按代理 card id 限定注册（`<name>_<owner_id>`），不同代理的同名工具互不覆盖。
-- **感知与坐标**：只有截图。`get_window_state(pid, window_id)` 先把窗口置前，再截取该窗口边界，
+- **感知与坐标**：截图轨道。`get_window_state(pid, window_id)` 先把窗口置前，再截取该窗口边界，
   以 `data["multimodal"]` 图像项返回（`type="image"`、PNG data URL）。带 `pid` 的指针类工具，其
   `x,y` 是该窗口最新截图中的像素（左上角为原点），先把窗口置前再换算为屏幕坐标；无法置前时返回 ❌
   且不发送任何输入。不带 `pid` 时 `x,y` 为屏幕绝对坐标。`from_zoom=true` 时 `x,y` 是该 pid 最近一次
@@ -472,4 +473,21 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
   pyautogui），在 Linux 返回 `X11Backend`（python-xlib + EWMH + pyautogui，需要 `DISPLAY`），其他平台
   抛 `COMPONENT_TOOL_INIT_FAILED`。后端在第一次工具调用时才构建，pyautogui 在构建时才导入，所以构建
   工具与导入模块都不触碰显示器。输入始终是前台真实输入；所有阻塞调用经 `asyncio.to_thread` 执行。
-- **依赖**：`cua` extra（`pyautogui`、`psutil`；Windows 上 `pygetwindow`，Linux 上 `python-xlib`）。
+- **无障碍树轨道**（`accessibility.py`，F_22）：`list_accessible_windows` 列出无障碍接口自己的顶层
+  窗口（Windows UIA、Linux AT-SPI frame），以运行内别名 `aw1, aw2, …` 命名；
+  `get_accessibility_tree(window, depth, expand)` 返回剪枝后的文本树，每个元素一行，带运行内 id
+  `e1, e2, …`、角色、名称、值、状态与可用动作，不带坐标。别名与 id 由 `CuaDesktop.ax_index`
+  （`AccessibilityIndex`）分配，运行内不复用；同一窗口再次读树后旧 id 失效，用旧 id 返回 ❌。
+  两条轨道不共享标识：别名与 `list_windows` 的 window_id 之间不做任何映射。剪枝丢弃隐藏元素
+  （UIA `IsOffscreen` / AT-SPI 非 `SHOWING`）及其子树，跳过无名称、无值、无动作的布局容器并提升其
+  子元素，密码字段不显示值；默认深度 25（最大 60），读取至多 1500 个节点、显示至多 400 个，回复注明
+  省略数。`invoke(element, action)` 执行元素的无障碍动作（UIA Invoke / Toggle / SelectionItem /
+  ExpandCollapse，AT-SPI `doAction`）；`set_value(element, text)` 经 UIA `ValuePattern` 或 AT-SPI
+  `EditableText` / `Value` 写入后读回，值未保留时返回 ❌ 并提示改用 `type_text`，密码字段不读回。
+  两者执行前重新读取元素，角色或名称已变或元素已不存在时返回 ❌。它们不使用鼠标键盘、不需要窗口
+  置前。`accessibility.create_accessibility_backend()` 在 Windows 用 `uiautomation`，在 Linux 用
+  `pyatspi`，首次调用时导入；缺库时每次调用返回带安装提示的 ❌，并在下次调用时重试构建。所有后端
+  调用在同一个专用线程上执行，超过 15 秒未返回即为 ❌。
+- **依赖**：`cua` extra（`pyautogui`、`psutil`；Windows 上 `pygetwindow` 与 `uiautomation`，Linux 上
+  `python-xlib`）。Linux 的无障碍树还需系统包 `python3-pyatspi`（或 PyGObject 加
+  `gir1.2-atspi-2.0`）与 `at-spi2-core`，pip 无法安装。
