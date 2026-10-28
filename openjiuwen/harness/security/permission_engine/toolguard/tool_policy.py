@@ -75,6 +75,8 @@ _OS_CONTROL_TOOL_NAMES = (
     "launch_app",
     "kill_app",
     "bring_to_front",
+    "invoke",
+    "set_value",
 )
 _OS_CONTROL_TOOLS = frozenset(f"{_OS_CONTROL_TOOL_PREFIX}{name}" for name in _OS_CONTROL_TOOL_NAMES)
 

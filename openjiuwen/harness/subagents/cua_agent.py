@@ -127,9 +127,38 @@ CUA_KILL_APP_PROMPT_SUFFIX: Dict[str, str] = {
 }
 
 
+# Appended only when the accessibility capability grants its tools. The two
+# tracks name windows differently and are never mixed in one call.
+CUA_ACCESSIBILITY_PROMPT_SUFFIX: Dict[str, str] = {
+    "cn": (
+        "无障碍树：list_accessible_windows 列出窗口别名（aw1、aw2…），get_accessibility_tree(window) "
+        "以文本返回该窗口的控件，每个元素带 id（e1、e2…）、角色、名称、值、状态和可用动作。"
+        "invoke(element) 执行元素的动作，set_value(element, text) 写入字段的值；它们通过应用的"
+        "无障碍接口执行，不使用鼠标键盘，窗口不必在前台。这些别名和 id 与 list_windows 的 "
+        "window_id 无关，不要混用。元素 id 只在该窗口下次读取树之前有效；操作后重新读取树来验证。"
+        "当树为空、缺少目标控件、元素没有可用动作，或 set_value 报告应用未保留该值时，"
+        "改用截图工具（get_window_state 与 click/type_text）。"
+    ),
+    "en": (
+        " Accessibility tree: list_accessible_windows lists window aliases (aw1, aw2, ...) and "
+        "get_accessibility_tree(window) returns that window's controls as text, each element with an id "
+        "(e1, e2, ...), role, name, value, states and supported actions. invoke(element) performs an "
+        "element's action and set_value(element, text) writes a field's value; both go through the app's "
+        "accessibility API, not the mouse or keyboard, so the window need not be in front. These aliases "
+        "and ids are unrelated to list_windows' window_id; never mix them. Element ids are valid until "
+        "the window's tree is read again; read it again after acting to verify. When the tree is empty, "
+        "lacks the target, the element has no action, or set_value reports the app did not keep the "
+        "value, switch to the screenshot tools (get_window_state with click / type_text)."
+    ),
+}
+
+
 def _default_system_prompt(language: str, allowed_tool_names: Iterable[str] = ()) -> str:
+    allowed = tuple(allowed_tool_names)
     prompt = DEFAULT_CUA_AGENT_SYSTEM_PROMPT.get(language, DEFAULT_CUA_AGENT_SYSTEM_PROMPT["cn"])
-    if "kill_app" in allowed_tool_names:
+    if "get_accessibility_tree" in allowed:
+        prompt += CUA_ACCESSIBILITY_PROMPT_SUFFIX.get(language, CUA_ACCESSIBILITY_PROMPT_SUFFIX["cn"])
+    if "kill_app" in allowed:
         prompt += CUA_KILL_APP_PROMPT_SUFFIX.get(language, CUA_KILL_APP_PROMPT_SUFFIX["cn"])
     return prompt
 
@@ -152,6 +181,15 @@ CUA_PERMISSION_RULES: tuple[dict, ...] = (
         "id": "cua_desktop_launch_app",
         "description": "启动桌面应用程序（launch_app），可能运行任意本机程序",
         "tools": ["launch_app"],
+        "match_type": "os_control",
+        "pattern": "*",
+        "severity": "HIGH",
+        "action": "ask",
+    },
+    {
+        "id": "cua_desktop_set_value",
+        "description": "通过无障碍接口写入字段的值（set_value），可能写入密码或其他敏感字段",
+        "tools": ["set_value"],
         "match_type": "os_control",
         "pattern": "*",
         "severity": "HIGH",
@@ -401,7 +439,7 @@ def create_cua_agent(
                     (
                         "ToolResultWindowProcessor",
                         ToolResultWindowProcessorConfig(
-                            tool_names=["get_window_state", "zoom"],
+                            tool_names=["get_window_state", "zoom", "get_accessibility_tree"],
                             keep_last_k=cua_snapshot_keep_last_k,
                             trim_size=_CUA_OFFLOAD_PREVIEW_CHARS,
                         ),

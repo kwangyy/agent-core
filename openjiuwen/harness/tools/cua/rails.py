@@ -69,10 +69,12 @@ _REPEAT_ADVISORY = (
     "get_window_state and address the target differently, or report what is blocking you."
 )
 
-_SNAPSHOT_TOOLS = frozenset({"get_window_state"})
+_SNAPSHOT_TOOLS = frozenset({"get_window_state", "get_accessibility_tree"})
 
 # cua tools that observe without changing what is on screen.
-_READ_ONLY_TOOLS = frozenset({"list_windows", "list_apps", "get_cursor_position", "get_screen_size", "zoom"})
+_READ_ONLY_TOOLS = frozenset(
+    {"list_windows", "list_apps", "get_cursor_position", "get_screen_size", "zoom", "list_accessible_windows"}
+)
 
 _REPEAT_BLOCKED = (
     "Blocked: this exact call has already returned the same non-success response {count} times "
@@ -599,6 +601,9 @@ class CuaProgressRail(AgentRail):
             args, _ = _normalize_tool_args(inputs.tool_args)
             if args is not None and (args.get("pid") is not None or args.get("window_id") is not None):
                 self._current_window = {"pid": args.get("pid"), "window_id": args.get("window_id")}
+            elif args is not None and args.get("window"):
+                # get_accessibility_tree names windows by accessibility alias.
+                self._current_window = {"accessible_window": args.get("window")}
             return
         if short_name in _READ_ONLY_TOOLS:
             return

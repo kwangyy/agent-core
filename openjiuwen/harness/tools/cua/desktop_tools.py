@@ -7,6 +7,10 @@ pointer tool takes ``x``/``y`` in that screenshot's pixels (window-local, origin
 top-left). Input is real foreground input, so a window-scoped action first
 brings its window to the front and fails rather than type into another one.
 
+The accessibility tools (``list_accessible_windows``, ``get_accessibility_tree``,
+``invoke``, ``set_value``) are a separate track with their own window aliases
+and element ids; see ``accessibility.py``.
+
 Results follow the cua-driver text contract the cua rails read: a reply starting
 with ``✅`` is an action that ran, one starting with ``❌`` is one that could not.
 """
@@ -26,6 +30,15 @@ from typing import Any, Callable
 
 from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.core.foundation.tool.schema import ToolOutput
+from openjiuwen.harness.tools.cua.accessibility import (
+    DEFAULT_TREE_DEPTH,
+    MAX_READ_NODES,
+    MAX_TREE_DEPTH,
+    AccessibilityBackend,
+    AccessibilityError,
+    AccessibilityIndex,
+    create_accessibility_backend,
+)
 from openjiuwen.harness.tools.cua.backend import DesktopBackend, WindowInfo, create_desktop_backend
 
 _OK = "✅"
@@ -52,13 +65,20 @@ class _ZoomOrigin:
 
 
 class CuaDesktop:
-    """Backend plus the per-run state the tools share (zoom origins)."""
+    """Backends plus the per-run state the tools share (zoom origins, accessibility aliases)."""
 
-    def __init__(self, backend_factory: Callable[[], DesktopBackend] = create_desktop_backend) -> None:
+    def __init__(
+        self,
+        backend_factory: Callable[[], DesktopBackend] = create_desktop_backend,
+        accessibility_factory: Callable[[], AccessibilityBackend] = create_accessibility_backend,
+    ) -> None:
         self._backend_factory = backend_factory
         self._backend: DesktopBackend | None = None
+        self._accessibility_factory = accessibility_factory
+        self._accessibility: AccessibilityBackend | None = None
         self._lock = threading.Lock()
         self.zoom_origins: dict[int, _ZoomOrigin] = {}
+        self.ax_index = AccessibilityIndex()
 
     @property
     def backend(self) -> DesktopBackend:
@@ -67,6 +87,14 @@ class CuaDesktop:
             if self._backend is None:
                 self._backend = self._backend_factory()
             return self._backend
+
+    @property
+    def accessibility(self) -> AccessibilityBackend:
+        """The accessibility backend, built on first use; a failed build is retried on the next call."""
+        with self._lock:
+            if self._accessibility is None:
+                self._accessibility = self._accessibility_factory()
+            return self._accessibility
 
     def window(self, pid: int, window_id: int | None) -> WindowInfo:
         """The pid's window: ``window_id`` when given, else its frontmost on-screen one."""
@@ -401,6 +429,116 @@ def _kill_app(desktop: CuaDesktop, args: dict) -> ToolOutput:
     return _ok(f"Killed pid {pid}.")
 
 
+def _ax_window_row(alias: str, win: Any) -> str:
+    flags = [flag for flag, on in (("active", win.active), ("minimized", win.minimized)) if on]
+    suffix = f"  {', '.join(flags)}" if flags else ""
+    return f"[{alias}] pid {win.pid} {win.app_name or '?'} {json.dumps(win.title, ensure_ascii=False)}{suffix}"
+
+
+def _list_accessible_windows(desktop: CuaDesktop, args: dict) -> ToolOutput:
+    pid = _integer(args, "pid")
+    windows = [w for w in desktop.accessibility.list_windows() if pid is None or w.pid == pid]
+    rows = desktop.ax_index.register_windows(windows)
+    listing = "\n".join(_ax_window_row(alias, win) for alias, win in rows)
+    return _ok(
+        f"Found {len(rows)} accessible window(s). These aliases are only for the accessibility tools, "
+        f"not for list_windows / get_window_state.\n{listing}"
+    )
+
+
+def _get_accessibility_tree(desktop: CuaDesktop, args: dict) -> ToolOutput:
+    alias = str(args.get("window") or "").strip()
+    if not alias:
+        raise CuaToolError("Missing required string field window.")
+    win = desktop.ax_index.window(alias)
+    depth = _integer(args, "depth", default=DEFAULT_TREE_DEPTH)
+    if depth is None or not 1 <= depth <= MAX_TREE_DEPTH:
+        raise CuaToolError(f"depth must be between 1 and {MAX_TREE_DEPTH}, got {depth!r}.")
+    root_ref, scope = win.ref, ""
+    expand = args.get("expand")
+    if expand:
+        entry = desktop.ax_index.element(str(expand))
+        if entry.window_alias != alias:
+            raise CuaToolError(f"{expand} belongs to {entry.window_alias}, not {alias}.")
+        root_ref, scope = entry.ref, f" from {expand}"
+    tree = desktop.accessibility.read_tree(root_ref, depth, MAX_READ_NODES)
+    text, omitted = desktop.ax_index.render_tree(alias, tree)
+    notes = []
+    if omitted:
+        notes.append(f"{omitted} more node(s) not shown; pass expand=<element id> to read a subtree.")
+    if win.minimized:
+        notes.append("The window is minimized, so most of its tree may be missing.")
+    if not text:
+        notes.append("The tree has no visible elements; use the screenshot tools for this window.")
+    footer = "\n" + " ".join(notes) if notes else ""
+    return _ok(
+        f"Accessibility tree of {alias} (pid {win.pid}, {json.dumps(win.title, ensure_ascii=False)}){scope}. "
+        f"Element ids are valid until this window's tree is read again.\n{text}{footer}"
+    )
+
+
+def _live_element(desktop: CuaDesktop, element_id: str) -> tuple[Any, Any]:
+    """The element's registry entry and current state, refusing one that changed identity."""
+    entry = desktop.ax_index.element(element_id)
+    node = desktop.accessibility.describe(entry.ref)
+    if (node.role, node.name) != (entry.role, entry.name):
+        raise CuaToolError(
+            f"{element_id} was {entry.role} {entry.name!r} but now reads as {node.role} {node.name!r}; "
+            f"read {entry.window_alias} again before acting."
+        )
+    return entry, node
+
+
+def _element_arg(args: dict) -> str:
+    element_id = str(args.get("element") or "").strip()
+    if not element_id:
+        raise CuaToolError("Missing required string field element.")
+    return element_id
+
+
+def _invoke(desktop: CuaDesktop, args: dict) -> ToolOutput:
+    element_id = _element_arg(args)
+    action = args.get("action")
+    entry, node = _live_element(desktop, element_id)
+    path = desktop.accessibility.perform(entry.ref, str(action) if action else None)
+    return _ok(
+        f"Invoked {node.role} {node.name!r} [{element_id}] via {path}. Read the window again with "
+        "get_accessibility_tree to check the effect."
+    )
+
+
+def _values_match(written: str, read_back: str | None) -> bool:
+    if read_back is None:
+        return written == ""
+    if read_back.strip() == written.strip():
+        return True
+    try:
+        return float(read_back) == float(written)
+    except ValueError:
+        # Providers may cap long text reads; a matching prefix still shows the write landed.
+        return len(written) > len(read_back) > 0 and written.startswith(read_back)
+
+
+def _set_value(desktop: CuaDesktop, args: dict) -> ToolOutput:
+    element_id = _element_arg(args)
+    text = args.get("text")
+    if not isinstance(text, str):
+        raise CuaToolError("Missing required string field text.")
+    entry, node = _live_element(desktop, element_id)
+    path = desktop.accessibility.set_value(entry.ref, text)
+    label = f"{node.role} {node.name!r} [{element_id}]"
+    if node.password:
+        return _ok(f"Wrote {len(text)} char(s) into {label} via {path}; a password field cannot be read back.")
+    read_back = desktop.accessibility.describe(entry.ref).value
+    if not _values_match(text, read_back):
+        raise CuaToolError(
+            f"wrote {label} via {path}, but it now reads {read_back!r}: the app did not keep the value. "
+            "This field likely only accepts real typing; use the screenshot tools (get_window_state, "
+            "click the field, type_text)."
+        )
+    return _ok(f"Set {label} to {len(text)} char(s) via {path}; read back the same value.")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -637,6 +775,65 @@ _SPECS: tuple[tuple[str, str, dict, Callable[[CuaDesktop, dict], ToolOutput]], .
         _bring_to_front,
     ),
     (
+        "list_accessible_windows",
+        "List top-level windows as the accessibility API sees them: alias (aw1, aw2, ...), pid, app "
+        "name, title, active/minimized. Aliases are for get_accessibility_tree only; they are unrelated "
+        "to list_windows' window_id.",
+        _object({"pid": {"type": "integer", "description": "Optional pid filter."}}),
+        _list_accessible_windows,
+    ),
+    (
+        "get_accessibility_tree",
+        "Read a window's accessibility tree as text, pruned to visible controls: one line per element "
+        "with its id (e1, e2, ...), role, name, value, states and supported actions. Does not bring the "
+        "window to the front. Element ids are valid until the window's tree is read again.",
+        _object(
+            {
+                "window": {"type": "string", "description": "Window alias from list_accessible_windows, e.g. aw2."},
+                "depth": {
+                    "type": "integer",
+                    "description": f"Maximum depth to read. Default {DEFAULT_TREE_DEPTH}, at most {MAX_TREE_DEPTH}.",
+                },
+                "expand": {
+                    "type": "string",
+                    "description": "Optional element id from the latest tree: read only that element's subtree.",
+                },
+            },
+            ("window",),
+        ),
+        _get_accessibility_tree,
+    ),
+    (
+        "invoke",
+        "Perform an element's accessibility action (press a button, toggle a checkbox, select an item, "
+        "expand or collapse). Goes through the app, not the mouse: the window need not be in front.",
+        _object(
+            {
+                "element": {"type": "string", "description": "Element id from the latest get_accessibility_tree."},
+                "action": {
+                    "type": "string",
+                    "description": "Optional action from the element's actions list (click, toggle, select, "
+                    "expand, collapse). Default: its first action.",
+                },
+            },
+            ("element",),
+        ),
+        _invoke,
+    ),
+    (
+        "set_value",
+        "Replace an editable element's value (text field, spin box) through the accessibility API, not the "
+        "keyboard, then read it back. Fails when the app does not keep the value; such fields need type_text.",
+        _object(
+            {
+                "element": {"type": "string", "description": "Element id from the latest get_accessibility_tree."},
+                "text": {"type": "string", "description": "The new value."},
+            },
+            ("element", "text"),
+        ),
+        _set_value,
+    ),
+    (
         "kill_app",
         "Force-terminate a process by pid. Unsaved state is lost; prefer closing the window first.",
         _object({"pid": {"type": "integer", "description": "PID of the process to terminate."}}, ("pid",)),
@@ -659,7 +856,7 @@ class CuaDesktopTool(Tool):
         args = dict(inputs) if isinstance(inputs, dict) else {}
         try:
             return await asyncio.to_thread(self._handler, self._desktop, args)
-        except CuaToolError as exc:
+        except (CuaToolError, AccessibilityError) as exc:
             return ToolOutput(success=False, error=f"{_FAIL} {exc}")
         except Exception as exc:  # noqa: BLE001 - every desktop failure becomes a ❌ reply the rails read
             return ToolOutput(success=False, error=f"{_FAIL} {self.card.name} failed: {type(exc).__name__}: {exc}")

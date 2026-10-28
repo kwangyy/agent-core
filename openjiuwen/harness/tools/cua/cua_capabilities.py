@@ -40,6 +40,16 @@ APP_LIFECYCLE_CUA_TOOL_NAMES: tuple[str, ...] = (
     "launch_app",
 )
 
+# The accessibility-tree track: its own window aliases and element ids, and
+# actions that go through the app instead of the mouse and keyboard. Opt-in:
+# on Linux it needs system AT-SPI packages that the cua extra cannot install.
+ACCESSIBILITY_CUA_TOOL_NAMES: tuple[str, ...] = (
+    "get_accessibility_tree",
+    "invoke",
+    "list_accessible_windows",
+    "set_value",
+)
+
 # Kept out of the default grant: the cua agent's permission rules deny kill_app,
 # so it is only offered when an operator asks for it explicitly.
 APP_TERMINATION_CUA_TOOL_NAMES: tuple[str, ...] = ("kill_app",)
@@ -81,6 +91,14 @@ DEFAULT_CUA_CAPABILITIES: tuple[CuaCapability, ...] = (
         name="app_lifecycle",
         description="Launch or foreground desktop applications.",
         tool_names=APP_LIFECYCLE_CUA_TOOL_NAMES,
+    ),
+    CuaCapability(
+        name="accessibility",
+        description=(
+            "Read windows' accessibility trees as text and act on their elements (press, toggle, select, "
+            "expand, set a field's value) through the accessibility API instead of the mouse and keyboard."
+        ),
+        tool_names=ACCESSIBILITY_CUA_TOOL_NAMES,
     ),
     CuaCapability(
         name="app_termination",
@@ -160,6 +178,7 @@ def resolve_cua_capabilities(
 
 
 __all__ = [
+    "ACCESSIBILITY_CUA_TOOL_NAMES",
     "APP_LIFECYCLE_CUA_TOOL_NAMES",
     "APP_TERMINATION_CUA_TOOL_NAMES",
     "CORE_CUA_CAPABILITY_NAME",

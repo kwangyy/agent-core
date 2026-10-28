@@ -131,6 +131,8 @@ cua = [
     "pyautogui>=0.9.54",
     "psutil>=5.9.0",
     "pygetwindow>=0.0.9; sys_platform == 'win32'",
+    # Accessibility tree on Windows. Linux uses the system pyatspi package, which pip cannot install.
+    "uiautomation>=2.0.18; sys_platform == 'win32'",
     "python-xlib>=0.33; sys_platform == 'linux'",
 ]
 mobile-gui = [
