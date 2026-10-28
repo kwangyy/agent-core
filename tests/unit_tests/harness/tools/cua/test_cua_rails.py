@@ -686,6 +686,22 @@ async def test_current_window_tracks_the_latest_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_current_window_tracks_an_accessibility_tree_read() -> None:
+    rail = CuaProgressRail(_PREFIX)
+    await rail.before_invoke(_invoke_ctx())
+
+    await _snap(rail, "get_window_state", {"pid": 1, "window_id": 2}, _WIN_A)
+    await _snap(rail, "get_accessibility_tree", {"window": "aw3"}, "\u2705 Accessibility tree of aw3 ...")
+    await _snap(rail, "list_accessible_windows", {}, "\u2705 Found 2 accessible window(s).")
+
+    result: dict = {"output": "..."}
+    await rail.after_invoke(_after_invoke_ctx(result))
+
+    assert result["cua_result"]["current_window"] == {"accessible_window": "aw3"}
+    assert result["cua_result"]["blockers"] == []
+
+
+@pytest.mark.asyncio
 async def test_blockers_accumulate_for_non_success_action_responses() -> None:
     rail = CuaProgressRail(_PREFIX)
     await rail.before_invoke(_invoke_ctx())

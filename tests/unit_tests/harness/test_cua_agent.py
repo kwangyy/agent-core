@@ -22,6 +22,7 @@ from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.security.models import PermissionLevel
 from openjiuwen.harness.security.permission_engine import PermissionEngine
 from openjiuwen.harness.subagents.cua_agent import (
+    CUA_ACCESSIBILITY_PROMPT_SUFFIX,
     CUA_AGENT_FACTORY_NAME,
     CUA_KILL_APP_PROMPT_SUFFIX,
     DEFAULT_CUA_AGENT_SYSTEM_PROMPT,
@@ -133,7 +134,7 @@ def test_default_wiring_windows_cua_capture_results() -> None:
     assert isinstance(cfg, ToolResultWindowProcessorConfig)
     # Pin the intended contract literally (not against a source constant) so a
     # regression like a renamed tool silently dropping out is actually caught.
-    assert cfg.tool_names == ["get_window_state", "zoom"]
+    assert cfg.tool_names == ["get_window_state", "zoom", "get_accessibility_tree"]
     assert cfg.keep_last_k == 3
 
 
@@ -348,6 +349,33 @@ def test_cua_permission_rules_merge_into_caller_permissions_without_replacing_th
     assert agent.deep_config.permissions["defaults"] == {"*": "allow"}
     # The caller's dict is theirs: merging must not edit it in place.
     assert [r["id"] for r in caller["rules"]] == ["caller_no_secret_typing"]
+
+
+@pytest.mark.parametrize("language", ["cn", "en"])
+def test_accessibility_guidance_follows_the_capability_grant(language: str) -> None:
+    default_agent = create_cua_agent(_create_dummy_model(), language=language)
+    assert "get_accessibility_tree" not in default_agent.deep_config.system_prompt
+    assert "get_accessibility_tree" not in _cua_tools(default_agent)
+
+    granted = ["input", "app_lifecycle", "accessibility", "app_termination"]
+    agent = create_cua_agent(_create_dummy_model(), language=language, cua_capabilities=granted)
+
+    assert agent.deep_config.system_prompt == (
+        DEFAULT_CUA_AGENT_SYSTEM_PROMPT[language]
+        + CUA_ACCESSIBILITY_PROMPT_SUFFIX[language]
+        + CUA_KILL_APP_PROMPT_SUFFIX[language]
+    )
+    assert {"list_accessible_windows", "get_accessibility_tree", "invoke", "set_value"} <= set(_cua_tools(agent))
+
+
+def test_set_value_asks_like_type_text_and_invoke_follows_caller_defaults() -> None:
+    engine = _engine_for(create_cua_agent(_create_dummy_model(), language="en", permissions=_caller_permissions()))
+
+    written, written_rule = engine.check_tool_permission_directly("set_value", {"element": "e3", "text": "hi"})
+    invoked, _ = engine.check_tool_permission_directly("invoke", {"element": "e7"})
+
+    assert written == PermissionLevel.ASK and "cua_desktop_set_value" in str(written_rule)
+    assert invoked == PermissionLevel.ALLOW
 
 
 def test_kill_app_deny_survives_a_permissive_caller_config() -> None:

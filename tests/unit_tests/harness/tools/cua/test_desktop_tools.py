@@ -138,13 +138,13 @@ def test_tools_carry_the_bare_cua_driver_names() -> None:
     assert [t.card.name for t in tools] == list(CUA_DESKTOP_TOOL_NAMES)
     assert {"click", "get_window_state", "type_text", "kill_app", "launch_app"} <= set(CUA_DESKTOP_TOOL_NAMES)
     assert all(t.card.id == f"tool.cua.{t.card.name}" for t in tools)
-    assert not {"get_accessibility_tree", "set_value"} & set(CUA_DESKTOP_TOOL_NAMES)
+    assert {"list_accessible_windows", "get_accessibility_tree", "invoke", "set_value"} <= set(CUA_DESKTOP_TOOL_NAMES)
 
 
 def test_names_filter_rejects_unknown_tools() -> None:
     assert [t.card.name for t in build_cua_desktop_tools(names=("click",))] == ["click"]
-    with pytest.raises(ValueError, match="set_value"):
-        build_cua_desktop_tools(names=("click", "set_value"))
+    with pytest.raises(ValueError, match="get_ax_tree"):
+        build_cua_desktop_tools(names=("click", "get_ax_tree"))
 
 
 def test_backend_is_not_built_until_a_tool_runs() -> None:
