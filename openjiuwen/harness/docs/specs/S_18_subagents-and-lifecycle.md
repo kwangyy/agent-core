@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/subagents/`（9 文件）、`openjiuwen/harness/tools/cua/`、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-10-14 |
-| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-desktop-subagent |
+| 最近一次修订日期 | 2026-11-03 |
+| 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-desktop-subagent、F_22_cua-agent-log-file |
 
 ## 范围 / 边界
 
@@ -430,3 +430,24 @@ LLM/Jev 共享 local_context，复杂目标复用可选 objective/绑定；普�
 `retryable`、处理超时和续跑，契约见 `S_05`。
 
 **平台**：Windows 与 Linux X11；其他平台在预检时失败。
+
+**专用日志**（F_22）：每个 cua 会话写入独立文件 `<日志目录>/<session_id>/cua_agent.log`（默认
+日志目录 `./logs/cua_agent/`，追加写），并行运行互不混写；思路沿用 browser_agent 的 `browser_agent.log`：
+
+- `CuaRuntimeRail.before_invoke` 以 `ctx.session.get_session_id()` 打开该会话文件，并把
+  `cua_context` 的 ContextVar 设为该 session id；`after_invoke` 复位并关闭文件句柄。令牌存于
+  `ctx.extra`，审批重入时上下文已开则不再嵌套。上下文开启期间，`DefaultLogger` 把所有框架日志
+  （LLM 调用、`Executing tool`、rails）写入 `openjiuwen.cua_agent.<session_id>` logger，不进合并日志。
+- 开启前在合并日志写一行 `[CUA_AGENT_LOG] session <id> logging to <path>`；TaskTool 的
+  `Invoking subagent` 行仍在合并日志，其 `sub_session_id` 即子代理 session id、亦即目录名。
+- 每次桌面工具调用由 `CuaDesktopTool.invoke` 写一行 `[CUA_ACTION]` JSON：`tool` / `args` /
+  `success` / `elapsed_ms` / `result`（`content` 或 `error`）/ `images`（截图只计数不落盘）；失败为
+  WARNING。上下文之外调用的工具写入 common logger。
+- 每次模型调用由 `CuaRuntimeRail.after_model_call` 写一行 `[CUA_MODEL]` JSON：`iteration` /
+  `finish_reason` / `content` / `reasoning` / `tool_calls`（`name` + 原始 `arguments`）；仅在上下文
+  开启时写入（流式调用的框架日志只记长度）。
+- session id 中 `[A-Za-z0-9._-]` 以外的字符替换为 `_`，目录不会越出日志目录。
+- 环境变量：`OPENJIUWEN_CUA_AGENT_LOG_DIR`（日志目录；`0/false/no/off/none/null/-` 关闭，关闭时
+  上下文不开启、动作行回落到 common logger）、`OPENJIUWEN_CUA_AGENT_LOG_LEVEL`、
+  `OPENJIUWEN_CUA_AGENT_LOG_MIRROR_COMMON=1`（同时写入合并日志）。
+- 日志不脱敏：`args` 含 `type_text` 的原文，`[CUA_INVOKE_START]` 含完整任务描述。
