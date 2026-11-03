@@ -25,6 +25,7 @@ from typing import (
 )
 
 from openjiuwen.core.common.logging.browser_context import is_browser_agent_log_context
+from openjiuwen.core.common.logging.cua_context import cua_agent_logger_name, get_cua_agent_log_session
 from openjiuwen.core.common.logging.base_impl import (
     format_log_filename,
     resolve_log_type_label,
@@ -433,6 +434,15 @@ class DefaultLogger(DefaultStructuredLoggerMixin, LoggerProtocol):
             getattr(browser_logger, level)(processed_msg, stacklevel=stacklevel, **extra)
             mirror_common = os.getenv(
                 "OPENJIUWEN_BROWSER_AGENT_LOG_MIRROR_COMMON",
+                "0",
+            ).strip().lower()
+            if mirror_common not in {"1", "true", "yes", "on"}:
+                return
+        elif (cua_session := get_cua_agent_log_session()) is not None:
+            cua_logger = logging.getLogger(cua_agent_logger_name(cua_session))
+            getattr(cua_logger, level)(processed_msg, stacklevel=stacklevel, **extra)
+            mirror_common = os.getenv(
+                "OPENJIUWEN_CUA_AGENT_LOG_MIRROR_COMMON",
                 "0",
             ).strip().lower()
             if mirror_common not in {"1", "true", "yes", "on"}:
