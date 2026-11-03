@@ -27,6 +27,7 @@ from typing import Any, Callable
 from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.core.foundation.tool.schema import ToolOutput
 from openjiuwen.harness.tools.cua.backend import DesktopBackend, WindowInfo, create_desktop_backend
+from openjiuwen.harness.tools.cua.cua_logging import cua_agent_log_info, cua_agent_log_warning
 
 _OK = "✅"
 _FAIL = "❌"
@@ -657,12 +658,32 @@ class CuaDesktopTool(Tool):
 
     async def invoke(self, inputs: Any, **kwargs: Any) -> ToolOutput:
         args = dict(inputs) if isinstance(inputs, dict) else {}
+        started = time.monotonic()
         try:
-            return await asyncio.to_thread(self._handler, self._desktop, args)
+            output = await asyncio.to_thread(self._handler, self._desktop, args)
         except CuaToolError as exc:
-            return ToolOutput(success=False, error=f"{_FAIL} {exc}")
+            output = ToolOutput(success=False, error=f"{_FAIL} {exc}")
         except Exception as exc:  # noqa: BLE001 - every desktop failure becomes a ❌ reply the rails read
-            return ToolOutput(success=False, error=f"{_FAIL} {self.card.name} failed: {type(exc).__name__}: {exc}")
+            output = ToolOutput(success=False, error=f"{_FAIL} {self.card.name} failed: {type(exc).__name__}: {exc}")
+        self._log_action(args, output, (time.monotonic() - started) * 1000)
+        return output
+
+    def _log_action(self, args: dict, output: ToolOutput, elapsed_ms: float) -> None:
+        """Record the action, its arguments and its outcome in cua_agent.log; images are counted, not dumped."""
+        data = output.data if isinstance(output.data, dict) else {}
+        record = {
+            "tool": self.card.name,
+            "args": args,
+            "success": output.success,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "result": data.get("content") if output.success else output.error,
+            "images": len(data.get("multimodal") or []),
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        if output.success:
+            cua_agent_log_info("[CUA_ACTION] %s", line)
+        else:
+            cua_agent_log_warning("[CUA_ACTION] %s", line)
 
     async def stream(self, inputs: Any, **kwargs: Any):
         yield await self.invoke(inputs, **kwargs)

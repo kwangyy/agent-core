@@ -20,11 +20,26 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import logger
+from openjiuwen.core.common.logging.cua_context import (
+    is_cua_agent_log_context,
+    reset_cua_agent_log_context,
+    set_cua_agent_log_context,
+)
 from openjiuwen.core.foundation.llm import ToolMessage
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail, ToolCallInputs
 from openjiuwen.harness.tools.cua.cua_capabilities import INPUT_CUA_TOOL_NAMES
+from openjiuwen.harness.tools.cua.cua_logging import (
+    close_cua_agent_log,
+    cua_agent_log_info,
+    cua_agent_log_warning,
+    get_cua_agent_log_path,
+    open_cua_agent_log,
+)
 from openjiuwen.harness.tools.cua.desktop_tools import CUA_DESKTOP_TOOL_NAMES, CuaDesktop
 from openjiuwen.harness.tools.cua.user_activity import UserActivityProbe, build_default_user_activity_probe
+
+# ctx.extra key holding the cua log-context token between before_invoke and after_invoke.
+_CUA_LOG_CONTEXT_TOKEN_KEY = "__cua_agent_log_context_token__"
 
 _PREFLIGHT_REMEDIATION = (
     "Install the desktop extra (`uv sync --extra cua`, or `pip install 'openjiuwen[cua]'`) and run the "
@@ -106,17 +121,76 @@ class CuaRuntimeRail(AgentRail):
         self._verified = False
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
+        self._enter_log_context(ctx)
         if self._verified:
             return
         try:
             await asyncio.to_thread(self._desktop.backend.screen_size)
         except Exception as exc:  # noqa: BLE001 - any failure here means no usable desktop
+            cua_agent_log_warning("[CUA_PREFLIGHT] failed: %s: %s", type(exc).__name__, exc)
+            self._exit_log_context(ctx)
             raise_error(
                 StatusCode.COMPONENT_TOOL_INIT_FAILED,
                 cause=exc,
                 error_msg=f"cua desktop preflight failed: {type(exc).__name__}: {exc}. {_PREFLIGHT_REMEDIATION}",
             )
         self._verified = True
+
+    async def after_invoke(self, ctx: AgentCallbackContext) -> None:
+        self._exit_log_context(ctx)
+
+    async def after_model_call(self, ctx: AgentCallbackContext) -> None:
+        """Write the model's reply to the run's file: the framework logs only its length for streamed calls."""
+        if not is_cua_agent_log_context():
+            return
+        inputs = getattr(ctx, "inputs", None)
+        response = getattr(inputs, "response", None)
+        if response is None:
+            return
+        record = {
+            "iteration": getattr(inputs, "react_iteration", 0),
+            "finish_reason": getattr(response, "finish_reason", None),
+            "content": getattr(response, "content", None),
+            "reasoning": getattr(response, "reasoning_content", None),
+            "tool_calls": [
+                {"name": call.name, "arguments": call.arguments} for call in getattr(response, "tool_calls", None) or []
+            ],
+        }
+        cua_agent_log_info("[CUA_MODEL] %s", json.dumps(record, ensure_ascii=False, default=str))
+
+    @staticmethod
+    def _enter_log_context(ctx: AgentCallbackContext) -> None:
+        """Route every log line of this run to its session's cua_agent.log, as the browser agent does for its own.
+
+        Skipped when the files are disabled or the context is already on (an
+        approval re-entry), so one invoke holds exactly one token.
+        """
+        extra = getattr(ctx, "extra", None)
+        if not isinstance(extra, dict) or is_cua_agent_log_context():
+            return
+        session = getattr(ctx, "session", None)
+        session_id = str(session.get_session_id()) if session is not None else "unknown_session"
+        log_path = get_cua_agent_log_path(session_id)
+        if log_path is None:
+            return
+        open_cua_agent_log(session_id)
+        # Logged before the context switches, so this lands in the combined log and
+        # points from there to the run's own file.
+        logger.info("[CUA_AGENT_LOG] session %s logging to %s", session_id, str(log_path))
+        extra[_CUA_LOG_CONTEXT_TOKEN_KEY] = (set_cua_agent_log_context(session_id), session_id)
+        query = getattr(getattr(ctx, "inputs", None), "query", None)
+        cua_agent_log_info("[CUA_INVOKE_START] session=%s query=%s", session_id, query)
+
+    @staticmethod
+    def _exit_log_context(ctx: AgentCallbackContext) -> None:
+        extra = getattr(ctx, "extra", None)
+        entry = extra.pop(_CUA_LOG_CONTEXT_TOKEN_KEY, None) if isinstance(extra, dict) else None
+        if entry is None:
+            return
+        token, session_id = entry
+        cua_agent_log_info("[CUA_INVOKE_END] session=%s", session_id)
+        reset_cua_agent_log_context(token)
+        close_cua_agent_log(session_id)
 
 
 def _cua_short_name(tool_name: str, tool_prefix: str) -> Optional[str]:
