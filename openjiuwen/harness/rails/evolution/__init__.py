@@ -159,6 +159,10 @@ __all__ = [
     "SuccessOutcome",
     "TrajectoryErrorSuccessDetector",
     "SignalBasedSuccessDetector",
+    "GuiOutcomeRail",
+    "GuiSelfEvolveConfig",
+    "VerifiedSuccessDetector",
+    "build_gui_self_evolve_rails",
 ]
 
 _TTSE_LAZY_ATTRS = {
@@ -169,6 +173,10 @@ _TTSE_LAZY_ATTRS = {
     "SuccessOutcome": ("openjiuwen.agent_evolving.ttse", "SuccessOutcome"),
     "TrajectoryErrorSuccessDetector": ("openjiuwen.agent_evolving.ttse", "TrajectoryErrorSuccessDetector"),
     "SignalBasedSuccessDetector": ("openjiuwen.agent_evolving.ttse", "SignalBasedSuccessDetector"),
+    "GuiOutcomeRail": ("openjiuwen.harness.rails.evolution.gui_self_evolve", "GuiOutcomeRail"),
+    "GuiSelfEvolveConfig": ("openjiuwen.harness.rails.evolution.gui_self_evolve", "GuiSelfEvolveConfig"),
+    "VerifiedSuccessDetector": ("openjiuwen.harness.rails.evolution.gui_self_evolve", "VerifiedSuccessDetector"),
+    "build_gui_self_evolve_rails": ("openjiuwen.harness.rails.evolution.gui_self_evolve", "build_gui_self_evolve_rails"),
 }
 
 
