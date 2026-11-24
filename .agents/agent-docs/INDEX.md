@@ -23,6 +23,7 @@ generated: true
 | [agent_teams/workflow](#module-agent_teams-workflow) |
 | [core.runner.resources_manager](#module-core-runner-resources_manager) |
 | [core.session.tracer](#module-core-session-tracer) |
+| [core/common/logging](#module-core-common-logging) |
 | [core/context_engine](#module-core-context_engine) |
 | [core/controller](#module-core-controller) |
 | [core/foundation/llm](#module-core-foundation-llm) |
@@ -54,6 +55,7 @@ generated: true
 
 | ID / 文档 | 类型 | 标题 | 作者 | 关联 D |
 |---|---|---|---|---|
+| [D-20261123-0925-gui-self-evolve](designs/active/D-20261123-0925-gui-self-evolve/design.md) | D | GUI agent self-evolution (harness-based online + data-based offline) | kwangyyinc | — |
 | [SDD-0024](designs/proposals/SDD-0024-trajectory-projection-evolution-rl/design.md) | D | 轨迹投影：把 OTel 标准轨迹投影为自演进与在线 AgentRL 输入 | @alan_cheng | — |
 
 <a id="module-agent_evolving-trajectory"></a>
@@ -357,6 +359,14 @@ generated: true
 |---|---|---|---|---|
 | [F_20261105_1405_otel-decorator-llm-telemetry](features/F_20261105_1405_otel-decorator-llm-telemetry.md) | F | 装饰器 llm span 遥测纯新增（弃外保内） | yidaaichixia | 无独立 D：方案在遥测重构评审讨论与 GitCode PR 线程（!3570/!3571 撤回后重做为纯新增线）中确认，无独立 D 文档。 |
 
+<a id="module-core-common-logging"></a>
+
+## core/common/logging
+
+| ID / 文档 | 类型 | 标题 | 作者 | 关联 D |
+|---|---|---|---|---|
+| [F_20261103_1510_cua-agent-log-file](features/F_20261103_1510_cua-agent-log-file.md) | F | cua_agent per-session log files | Vannes | 无独立 D：局部日志路由改动，沿用 browser_agent.log 方案，无独立设计。 |
+
 <a id="module-core-context_engine"></a>
 
 ## core/context_engine
@@ -499,6 +509,7 @@ generated: true
 |---|---|---|---|---|
 | [D-20261110-1903-team-goal-mode](designs/active/D-20261110-1903-team-goal-mode/design.md) | D | Team Leader 与成员 Goal 模式设计方案 | alan_cheng | — |
 | [D-20261112-1120-goal-assessment-isolation](designs/active/D-20261112-1120-goal-assessment-isolation/design.md) | D | Goal 独立评估的轨迹与执行上下文隔离 | alan_cheng | — |
+| [D-20261123-0925-gui-self-evolve](designs/active/D-20261123-0925-gui-self-evolve/design.md) | D | GUI agent self-evolution (harness-based online + data-based offline) | kwangyyinc | — |
 | [SDD-0006](designs/archive/SDD-0006-native-harness-async-tool-control-and-spill/design.md) | D | 原生 Harness 异步工具管控框架与磁盘溢写 | @alan_cheng | — |
 | [SDD-0022](designs/proposals/SDD-0022-trajectory-observability-framework/design.md) | D | 轨迹观测框架：基于 OTel GenAI 语义约定的 Harness 与 Team 轨迹采集和处理 | @alan_cheng | — |
 | [SDD-0024](designs/proposals/SDD-0024-trajectory-projection-evolution-rl/design.md) | D | 轨迹投影：把 OTel 标准轨迹投影为自演进与在线 AgentRL 输入 | @alan_cheng | — |
@@ -533,9 +544,11 @@ generated: true
 | [F_19_browser-observation-first-results](features/harness/F_19_browser-observation-first-results.md) | F | Browser observation-first results | 待确认 | 待核实 |
 | [F_20261027_1810_ttse-plugin-runtime](features/F_20261027_1810_ttse-plugin-runtime.md) | F | TTSE 插件构造上下文与关闭生命周期 | xinyang_bali | 无独立 D：用户确认执行外部 TTSE Rail 插件适配方案，原文位于 D:/files/自演进/方案/ttse适配code agent。 |
 | [F_20261103_0928_model-group-routed-model](features/F_20261103_0928_model-group-routed-model.md) | F | 模型组路由模型的全程命名与可观测 | hh0205 | 无独立 D：issue |
+| [F_20261103_1510_cua-agent-log-file](features/F_20261103_1510_cua-agent-log-file.md) | F | cua_agent per-session log files | Vannes | 无独立 D：局部日志路由改动，沿用 browser_agent.log 方案，无独立设计。 |
 | [F_20261104_1720_tool-execution-environment](features/F_20261104_1720_tool-execution-environment.md) | F | 工具执行环境作用域 | alan_cheng | 无独立 D：无独立 D；在现有 harness 工具调用与 team 会话存储契约上的小范围扩展。 |
 | [F_20261110_1922_team-goal-mode](features/F_20261110_1922_team-goal-mode.md) | F | Team Leader 与成员 Goal 模式实施与决策归档 | alan_cheng | [D-20261110-1903-team-goal-mode](designs/active/D-20261110-1903-team-goal-mode/design.md) |
 | [F_20261112_1120_goal-assessment-isolation](features/F_20261112_1120_goal-assessment-isolation.md) | F | Goal 评估调用的观测隔离实施 | alan_cheng | [D-20261112-1120-goal-assessment-isolation](designs/active/D-20261112-1120-goal-assessment-isolation/design.md) |
+| [F_20261123_1006_gui-self-evolve](features/F_20261123_1006_gui-self-evolve.md) | F | GUI agent self-evolution rails | kwangyyinc | [D-20261123-0925-gui-self-evolve](designs/active/D-20261123-0925-gui-self-evolve/design.md) |
 | [F_20_react-iteration-limit](features/harness/F_20_react-iteration-limit.md) | F | F_20 ReAct 迭代耗尽后的结构化结果 | openJiuwen-bot | 待核实 |
 | [F_21_browser-decision-observation-handoff](features/harness/F_21_browser-decision-observation-handoff.md) | F | Browser decision observation and local handoff | 待确认 | 待核实 |
 | [F_21_cua-desktop-subagent](features/harness/F_21_cua-desktop-subagent.md) | F | cua_agent desktop subagent | kwangyyinc | 待核实 |

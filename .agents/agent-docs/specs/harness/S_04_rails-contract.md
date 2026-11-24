@@ -18,8 +18,8 @@ author_email: yangzequ1@huawei.com
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/rails/` |
-| 最近一次修订日期 | 2026-11-21 |
-| 关联 feature | `F_01_ask-user-otel-events.md`、`F_02_genai-semconv-tool-spans.md`、`F_21_cua-desktop-subagent.md`、`F_22_cli-jiuwen-memory-rail-mount-and-switch.md` |
+| 最近一次修订日期 | 2026-11-23 |
+| 关联 feature | `F_01_ask-user-otel-events.md`、`F_02_genai-semconv-tool-spans.md`、`F_21_cua-desktop-subagent.md`、`F_22_cli-jiuwen-memory-rail-mount-and-switch.md`、`F_20261123_1006_gui-self-evolve.md` |
 
 ## 范围 / 边界
 
@@ -28,6 +28,14 @@ author_email: yangzequ1@huawei.com
 线程写入不能用取消 awaiter 证明停止，因此超时抛出 `TimeoutError` 并保留任务引用；
 宿主保持 closing、依赖和写权，重试关闭，不允许新 owner 接管。成功关闭后再执行同步 uninit。
 此约束仅属于 TTSE，不为其他 Rail 增加通用的异步关闭义务。
+
+GUI 自演进（`rails/evolution/gui_self_evolve.py`）经 GUI 工厂已有的 `rails=` 挂载 `TTSERail`，
+不修改工厂与其默认 rails。TTSE 的成功检测运行在脱离 ctx 的快照上，因此外部 verifier 评分
+不经 `ctx` 传递：`GuiOutcomeRail` 在 `after_invoke` 以 `EvolutionRail.priority + 1` 先于演进
+rail 运行，把评分（含无结论的 None）按 session 入 `VerifiedSuccessDetector` 的 FIFO 队列，
+检测时按轨迹 `session_id` 依序取出，并以 `ttse_score` 交给原检测器，成功阈值仍属 TTSE。
+verifier 异常只记 WARNING，不改变运行结果。`GuiSelfEvolveConfig.store_path` 必填且不得位于
+`openjiuwen` 包内：学到的状态只属于该智能体实例。
 
 本规约定义 `DeepAgent` 的 rail（行为约束层）的**跨子模块契约**：三层基类、
 事件命名空间路由、priority 梯队、挂载生命周期、两套平行拦截体系、rail 的编写清单。

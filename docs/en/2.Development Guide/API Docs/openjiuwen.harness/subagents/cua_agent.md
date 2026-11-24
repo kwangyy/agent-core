@@ -221,6 +221,47 @@ Expand capability names into a tool allowlist. `core` is always added, duplicate
 
 ---
 
+## Self-evolution
+
+`build_gui_self_evolve_rails` (in `openjiuwen.harness.rails.evolution`) makes a GUI agent learn from its own runs. The same rails work for `create_cua_agent`, `create_browser_agent` and `create_mobile_gui_agent`. Pass them through the factory's `rails=`:
+
+```python
+from openjiuwen.extensions.observability.config import ObservabilityConfig
+from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
+from openjiuwen.harness.observability import AgentObservabilityRail, acquire_observability
+from openjiuwen.harness.observability.run_span import close_agent_run_span, open_agent_run_span
+from openjiuwen.harness.rails.evolution import GuiSelfEvolveConfig, build_gui_self_evolve_rails
+
+acquire_observability(ObservabilityConfig(exporter="console"))
+processor = get_trajectory_span_processor()
+rails = build_gui_self_evolve_rails(
+    GuiSelfEvolveConfig(
+        llm=model,
+        model="model-name",
+        store_path="/path/owned/by/this/agent/bank.json",
+        trajectory_span_processor=processor,
+        inject_enabled=False,  # learn only; True also adds the learned rules to the prompt
+        verifier=verify,       # optional: async (result) -> 1.0 / 0.0 / None
+    )
+)
+agent = create_cua_agent(model, rails=[AgentObservabilityRail(), *rails])
+
+# Each run needs a run root span, or no LLM/tool spans are produced.
+handle = open_agent_run_span(session_id=session_id, mode="cua")
+try:
+    result = await Runner.run_agent(agent, {"query": query, "conversation_id": session_id})
+finally:
+    close_agent_run_span(handle, session_id=session_id, output=result)
+```
+
+- The rails are `TTSERail`, which learns facts and tips after each run and can inject them, plus `GuiOutcomeRail` when a `verifier` is given.
+- With a verifier, its score decides whether a run succeeded. Without one, TTSE's own detector decides. A verifier that raises an error is logged, and the run continues unchanged.
+- TTSE learns from the run's trace spans, so observability must be acquired, the agent must carry an `AgentObservabilityRail`, and each run must sit inside a run root span (`open_agent_run_span` / `close_agent_run_span`). Without any of these no LLM or tool spans are produced, and nothing is learned. The builder does not add that rail, because a host that already has one would record every span twice.
+- `store_path` is required and belongs to this agent instance. A path inside the `openjiuwen` package is refused.
+- Learned rules only reach the prompt. Permissions, tools and the rails above are not affected.
+
+---
+
 ## Delegation results and resume
 
 When a parent delegates through `task_tool`, the result `data` for `cua_agent` contains:
